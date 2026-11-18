@@ -1,0 +1,4 @@
+numpy==1.26.4
+onnxruntime==1.21.0
+soundfile==0.14.0
+realtimevad==0.0.5

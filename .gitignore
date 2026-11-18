@@ -1,0 +1,34 @@
+.env
+.env.*
+!.env.example
+**/.venv/
+**/__pycache__/
+main/runtime/
+main/models/
+
+**/.ui-venv/
+archive/
+LatentSync-trial/server.*.log
+LatentSync-trial/models/
+
+background-audio/models/
+background-audio/separator_packages/
+
+# Machine-local media, models, and render artifacts
+/LatentSync-trial/checkpoints/
+/LatentSync-trial/local_jobs/
+/LatentSync-trial/chunk_jobs/
+/LatentSync-trial/trial_inputs/
+/LatentSync-trial/trial_outputs/
+/LatentSync-trial/trial_temp/
+/LatentSync-trial/temp/
+*.onnx
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.partial
+*.log
+
+# Historical dependency checkout
+/vad-audio-lab/RealtimeVAD/
