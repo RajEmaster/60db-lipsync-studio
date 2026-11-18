@@ -16,6 +16,7 @@ from dotenv import load_dotenv
 ROOT = Path(__file__).resolve().parent
 load_dotenv(ROOT / '.env')
 DEFAULT_VOICE = '130b0b2d-feb7-4ae0-985c-5c401cdf1115'
+AUTO_LANGUAGE = 'auto'
 
 
 class CompatibleSixtyDBClient(SixtyDBClient):
@@ -44,7 +45,8 @@ class CompatibleSixtyDBClient(SixtyDBClient):
     def speech_to_text(self, audio_file, language=None, diarize=False):
         # SDK 2.2.0 uses the old 'audio' field and bypasses its session/timeout.
         # The current service expects 'file' and a multipart Content-Type.
-        data = {'language': language} if language else {}
+        language = (language or '').strip().lower()
+        data = {'language': language} if language and language != AUTO_LANGUAGE else {}
         if diarize:
             data['diarize'] = 'true'
         return self._request('POST', '/stt', files={
@@ -218,3 +220,14 @@ def transcribe_speakers(audio_path, language=None):
     if not isinstance(result, dict) or not isinstance(result.get('segments'), list):
         raise RuntimeError('60db returned no speaker segments.')
     return result['segments']
+
+
+def detect_spoken_language(audio_path):
+    with sdk_client() as client, Path(audio_path).open('rb') as audio:
+        result = client.speech_to_text(audio)
+    if isinstance(result, dict):
+        result = result.get('data', result)
+    language = result.get('language') if isinstance(result, dict) else None
+    if isinstance(language, str) and len(language) in (2, 3) and language.isalpha() and language not in ('und', 'mul'):
+        return language.lower()
+    raise ValueError('60db could not detect the clone sample language. Choose the spoken language from the dropdown.')

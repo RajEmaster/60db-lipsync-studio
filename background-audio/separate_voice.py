@@ -18,8 +18,9 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--input', required=True)
     parser.add_argument('--output', required=True)
+    parser.add_argument('--cpu-threads', type=int, default=4)
     args = parser.parse_args()
-    torch.set_num_threads(4)
+    torch.set_num_threads(args.cpu_threads)
     torch.hub.set_dir(str(ROOT / 'models' / 'torch'))
     data, rate = sf.read(args.input, dtype='float32', always_2d=True)
     if rate != 44100 or data.shape[1] != 2:

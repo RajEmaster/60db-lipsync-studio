@@ -89,12 +89,17 @@ def main():
     parser.add_argument('--min-seconds', type=float, default=4)
     parser.add_argument('--max-seconds', type=float, default=6)
     parser.add_argument('--target-seconds', type=float, default=5)
+    parser.add_argument('--overlap', type=float, default=0.4)
+    parser.add_argument('--vad-pause-seconds', type=float, default=0.3)
+    parser.add_argument('--cpu-threads', type=int, default=4)
     args = parser.parse_args()
     if args.parent_pid:
         from worker_lifecycle import watch_parent
         watch_parent(args.parent_pid)
     if not 0 <= args.background_gain <= 1:
         parser.error('--background-gain must be between 0 and 1')
+    if not 0.1 <= args.vad_pause_seconds <= 2 or not 1 <= args.cpu_threads <= 16:
+        parser.error('Use 0.1 to 2 seconds for the VAD pause and 1 to 16 CPU threads.')
     started = time.monotonic()
     job = Path(args.job)
     job.mkdir(parents=True, exist_ok=True)
@@ -120,7 +125,7 @@ def main():
     if background and not background.is_file() and not args.background_video:
         raise RuntimeError('The saved background track is missing and the original is unavailable.')
     if args.background_video and (not background_saved or (background and not background.is_file())):
-        background = extract_background(args.background_video, job, audio_duration)
+        background = extract_background(args.background_video, job, audio_duration, args.cpu_threads)
         if args.resume:
             save_json(marker, background.relative_to(job).as_posix() if background else None)
     plan = job / 'chunk_plan.json'
@@ -129,14 +134,15 @@ def main():
         manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
     else:
         print('Finding confirmed speech pauses with RealtimeVAD...', flush=True)
-        timing = speech_timestamps(audio, job)
-        print(f'Splitting near {args.target_seconds:g}s with RealtimeVAD gaps and 0.4s context per side...', flush=True)
+        timing = speech_timestamps(audio, job, args.vad_pause_seconds)
+        print(f'Splitting near {args.target_seconds:g}s with RealtimeVAD gaps and '
+              f'{args.overlap:g}s context per side...', flush=True)
         chunk_dir = job / 'chunks'
         if args.resume and chunk_dir.exists():
             chunk_dir = job / f'chunks_{uuid.uuid4().hex}'
         manifest_path = chunk_video(video, audio, chunk_dir, minimum=args.min_seconds,
                                     maximum=args.max_seconds, target=args.target_seconds,
-                                    prefer_pauses=False, pause_intervals=timing['pause_intervals'])
+                                    overlap=args.overlap, prefer_pauses=False, pause_intervals=timing['pause_intervals'])
         manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
         manifest['pause_detection'] = 'RealtimeVAD_confirmed_speech_ends'
         manifest['speech_intervals'] = timing['speech_intervals']
@@ -180,7 +186,7 @@ def main():
                    '--video', (manifest_path.parent / chunk['video']).resolve().relative_to(ROOT).as_posix(),
                    '--audio', (manifest_path.parent / chunk['audio']).resolve().relative_to(ROOT).as_posix(),
                    '--output', output.resolve().relative_to(ROOT).as_posix(),
-                   '--frames', str(args.frames), '--steps', str(args.steps)]
+                   '--frames', str(args.frames), '--steps', str(args.steps), '--cpu-threads', str(args.cpu_threads)]
         with log_path.open('w', encoding='utf-8') as log:
             result = subprocess.run(command, cwd=ROOT, stdout=log, stderr=subprocess.STDOUT)
         if result.returncode or not output.is_file():

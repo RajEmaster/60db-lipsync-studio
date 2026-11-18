@@ -33,9 +33,13 @@ InsightFace 0.7.3 source includes its [MIT license](LatentSync-trial/vendor/insi
 ## Run locally
 
 Run `./LatentSync-trial/start_ui.ps1`, then open http://127.0.0.1:7861.
-For longer projects, open **Long-video dubbing**. It saves progress in sections of about five minutes and renders 10–25 second clips. See [the pipeline guide](LatentSync-trial/PIPELINE.md) for speaker review, resumable jobs, and face detection.
-The UI supports text-to-speech and uploaded or recorded speech. 60db TTS is connected using the official sixtydb Python SDK.
-The earlier two-column UI and speech controls are retained for that integration.
+The main form uses the movie workflow for both short tests and full videos.
+Set the transcription section length, render clip range, VAD settings, and
+compute options directly on the form. Use **Start or resume job** to begin or
+continue with a saved job ID. See [the pipeline guide](LatentSync-trial/PIPELINE.md).
+The app uses 60db diarization and automatically links speakers across sections
+with a [CPU WeSpeaker model](https://huggingface.co/Wespeaker/wespeaker-voxceleb-resnet34-LM),
+downloaded on the first job that needs cross-section matching.
 
 The UI uses `.ui-venv`; GPU inference and Demucs use the existing `.venv`.
 FFmpeg and ffprobe must be on PATH. VAD policy and audio processing live in
@@ -44,19 +48,16 @@ application files; installed third-party sources are not modified.
 `vad-audio-lab/` contains historical reference notes. The app uses the
 installed RealtimeVAD package.
 
-Standard rendering targets five-second clips, using RealtimeVAD pauses within
-4–6 second bounds including overlap. Use **Resume standard render** with the
-job ID to reuse completed clips after an interruption.
+Defaults are roughly five-minute transcription sections and 10–25 second
+render clips. A resumed job uses its saved settings.
 
 Configure SIXTYDB_API_KEY and optionally SIXTYDB_SDK_BASE_URL in LatentSync-trial/.env (see .env.example). The app uses SDK text_to_speech and get_voices methods. Generated WAV audio is validated before rendering. Preview creates a speech WAV; Generate creates speech then renders the video. Unverified legacy emotion controls are omitted.
 
 Background separation runs from `background-audio/` when requested.
 
-SoX can be installed through winget (`ChrisBagwell.SoX`). Uploaded speech cleanup is
-enabled by default and can be disabled in the UI. It learns steady noise from a
-confirmed non-speech gap; unsuitable recordings are left unchanged. API speech
-skips cleanup. Demucs preserves the original background independently, and the
-complete speech and background tracks are mixed once before the final video mux.
+The separate supplied-speech render path can use SoX to learn steady noise
+from a confirmed non-speech gap. Demucs separates the original background,
+which is mixed with the complete speech track before the final video mux.
 Set MUSICTALK_SOX to override the SoX binary location.
 
 The SDK is pinned to sixtydb 2.2.0. The app includes a compatibility adapter for

@@ -11,7 +11,10 @@ import numpy as np
 import soundfile as sf
 
 from chunk_video import run, probe
-from tts_api import create_cloned_voice, sdk_client, transcribe, synthesize, transcribe_speakers
+from tts_api import (
+    AUTO_LANGUAGE, create_cloned_voice, detect_spoken_language, sdk_client, transcribe, synthesize,
+    transcribe_speakers,
+)
 import requests
 from vad import detect_speech
 from translation import translate, ORIGINAL_LANGUAGE
@@ -39,9 +42,7 @@ def reference_clone_record(video, language, sample_key=''):
 
 def clone_reference_voice(video, language, sample=None, sample_key=''):
     """Yield clone progress and the reusable voice ID once it can be selected."""
-    language = (language or '').strip().lower()
-    if not language:
-        raise ValueError('Enter the language spoken in the reference video, such as en or hi.')
+    language = (language or AUTO_LANGUAGE).strip().lower() or AUTO_LANGUAGE
     name, record = reference_clone_record(video, language, sample_key)
     if record.exists():
         result = json.loads(record.read_text(encoding='utf-8'))
@@ -55,9 +56,9 @@ def clone_reference_voice(video, language, sample=None, sample_key=''):
                 if not sf.info(original).frames:
                     raise ValueError('The reference video has no audio samples to clone.')
                 yield None, 'Submitting the reference voice sample to 60db...'
-                result = create_cloned_voice(name, original, language)
+                result = clone_sample(video, name, original, language, sample_key)
         else:
-            result = create_cloned_voice(name, sample, language)
+            result = clone_sample(video, name, sample, language, sample_key)
         temporary_record = record.with_suffix('.tmp')
         temporary_record.write_text(json.dumps(result), encoding='utf-8')
         temporary_record.replace(record)
@@ -89,6 +90,15 @@ def clone_reference_voice(video, language, sample=None, sample_key=''):
                     return
         yield None, f'Waiting for 60db voice clone {voice_id}...'
         time.sleep(10)
+
+
+def clone_sample(video, name, sample, language, sample_key):
+    if language == AUTO_LANGUAGE:
+        language = detect_spoken_language(sample)
+        name, language_record = reference_clone_record(video, language, sample_key)
+        if language_record.exists():
+            return json.loads(language_record.read_text(encoding='utf-8'))
+    return create_cloned_voice(name, sample, language)
 
 
 def tempo_filters(factor):
@@ -125,7 +135,7 @@ def speaker_turns(original, rate, sample_count, language):
 
 
 def replace_voice(video, voice, speed=1.0, duration=0, target_language=ORIGINAL_LANGUAGE,
-                  multiple_speakers=False, source_language='en', prepared_turns=None,
+                  multiple_speakers=False, source_language=AUTO_LANGUAGE, prepared_turns=None,
                   speaker_voices=None, job_folder=None):
     """Yield progress, then a complete new speech track and timestamped transcript."""
     if (not voice and not multiple_speakers and prepared_turns is None) or not 0.5 <= float(speed) <= 2:
@@ -183,7 +193,7 @@ def replace_voice(video, voice, speed=1.0, duration=0, target_language=ORIGINAL_
             clip = folder / f'segment_{index:03d}.wav'
             sf.write(clip, source[first:last], rate, subtype='PCM_16')
             yield None, '\n'.join(lines), f'Transcribing speech segment {index}/{len(turns)} with 60db...'
-            text = transcribe(clip)
+            text = transcribe(clip, source_language)
             if not text:
                 lines.append(f'[{start:.2f}s - {end:.2f}s] No speech transcribed.')
                 (folder / 'transcript.txt').write_text('\n'.join(lines), encoding='utf-8')

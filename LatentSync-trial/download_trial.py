@@ -5,7 +5,7 @@ import requests
 
 ROOT = Path(__file__).resolve().parent
 
-def download(repo, remote, target):
+def download(repo, remote, target, revision='main'):
     target = ROOT / target
     target.parent.mkdir(parents=True, exist_ok=True)
     if target.exists():
@@ -16,7 +16,7 @@ def download(repo, remote, target):
         offset = partial.stat().st_size if partial.exists() else 0
         try:
             with requests.get(
-                f'https://huggingface.co/{repo}/resolve/main/{remote}?download=true',
+                f'https://huggingface.co/{repo}/resolve/{revision}/{remote}?download=true',
                 headers={'Range': f'bytes={offset}-'} if offset else {},
                 stream=True, timeout=(20, 60),
             ) as response:

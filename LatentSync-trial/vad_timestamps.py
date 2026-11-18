@@ -8,8 +8,9 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--audio', required=True)
     parser.add_argument('--output', required=True)
+    parser.add_argument('--minimum-pause', type=float, default=0.3)
     args = parser.parse_args()
-    result = detect_speech(args.audio)
+    result = detect_speech(args.audio, minimum_pause=args.minimum_pause)
     Path(args.output).write_text(json.dumps(result, indent=2), encoding='utf-8')
     print(f"RealtimeVAD: {len(result['speech_intervals'])} speech segments, "
           f"{len(result['pause_intervals'])} confirmed gaps.", flush=True)

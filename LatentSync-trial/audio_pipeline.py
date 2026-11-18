@@ -16,7 +16,7 @@ SAMPLE_RATE = 44100
 SEPARATOR_PYTHON = WORKER_PYTHON
 
 
-def speech_timestamps(speech_audio, job):
+def speech_timestamps(speech_audio, job, minimum_pause=0.3):
     """Use confirmed RealtimeVAD endings on the speech driving lip-sync."""
     output = job / 'vad.json'
     vad_input = job / 'vad_input.wav'
@@ -24,11 +24,11 @@ def speech_timestamps(speech_audio, job):
          '-ar', '16000', '-ac', '1', '-c:a', 'pcm_s16le', str(vad_input)])
     subprocess.run([sys.executable, '-u',
                     str(LAB / 'vad_timestamps.py'), '--audio', str(vad_input),
-                    '--output', str(output)], check=True)
+                    '--output', str(output), '--minimum-pause', str(minimum_pause)], check=True)
     return json.loads(output.read_text(encoding='utf-8'))
 
 
-def extract_background(original_video, job, speech_duration):
+def extract_background(original_video, job, speech_duration, cpu_threads=4):
     """Estimate background from the ORIGINAL soundtrack, never from generated TTS."""
     info = probe(original_video)
     if not any(stream['codec_type'] == 'audio' for stream in info['streams']):
@@ -46,7 +46,8 @@ def extract_background(original_video, job, speech_duration):
          '-ar', str(SAMPLE_RATE), '-ac', '2', '-c:a', 'pcm_f32le', str(mix)])
     print('Separating original vocals from background on CPU...', flush=True)
     subprocess.run([str(SEPARATOR_PYTHON), '-u', str(ROOT.parent / 'background-audio' / 'separate_voice.py'),
-                    '--input', str(mix), '--output', str(folder)], check=True)
+                    '--input', str(mix), '--output', str(folder),
+                    '--cpu-threads', str(cpu_threads)], check=True)
     return folder / 'background.wav'
 
 

@@ -10,15 +10,21 @@ import uuid
 
 import gradio as gr
 from chunk_video import probe
-from tts_api import create_cloned_voice, sdk_client, synthesize, DEFAULT_VOICE, list_voices
+from tts_api import AUTO_LANGUAGE, create_cloned_voice, sdk_client, synthesize, DEFAULT_VOICE, list_voices
 from voice_replacement import clone_reference_voice, replace_voice
 from translation import LANGUAGES, ORIGINAL_LANGUAGE
-from long_video import JOBS
+from long_video import JOBS, LONG_RENDER_DEFAULTS, long_render_settings
 from render_chunks import save_json, valid_render
 
 ROOT = Path(__file__).resolve().parent
 WORKER_PYTHON = ROOT / '.venv' / 'Scripts' / 'python.exe'
 UI_PYTHON = Path(sys.executable)
+SOURCE_LANGUAGES = [
+    ('Auto-detect', AUTO_LANGUAGE), ('English', 'en'), ('Hindi', 'hi'), ('Bengali', 'bn'),
+    ('Tamil', 'ta'), ('Telugu', 'te'), ('Marathi', 'mr'), ('Gujarati', 'gu'),
+    ('Kannada', 'kn'), ('Malayalam', 'ml'), ('Punjabi', 'pa'), ('Odia', 'or'),
+    ('Spanish', 'es'), ('French', 'fr'), ('German', 'de'), ('Arabic', 'ar'),
+]
 
 for stream in (sys.stdout, sys.stderr):
     if hasattr(stream, 'reconfigure'):
@@ -73,7 +79,7 @@ def require_reference_audio(video):
 
 def generate_with_speech(source, text, voice, video, audio, duration, steps, frames,
                          restore_background, background_gain, speed, cleanup, target_language=ORIGINAL_LANGUAGE,
-                         use_reference_voice=False, source_language='en', multiple_speakers=False):
+                         use_reference_voice=False, source_language=AUTO_LANGUAGE, multiple_speakers=False):
     if not video or not Path(video).is_file():
         raise gr.Error('Upload a reference video.')
     transcript = ''
@@ -147,8 +153,9 @@ def stop_worker(process):
         process.wait()
 
 
-def run_long_video(video, job_id, mapping, single_speaker, voice_id, source_language,
-                   target_language, speed, duration, steps, frames, restore_background, background_gain):
+def run_long_video(video, job_id, single_speaker, voice_id, source_language,
+                   target_language, speed, duration, steps, frames, restore_background, background_gain,
+                   *render_values):
     job_id = (job_id or '').strip().lower()
     if job_id and (len(job_id) != 32 or any(c not in '0123456789abcdef' for c in job_id)):
         raise gr.Error('Enter the 32-character long-video job ID.')
@@ -168,25 +175,27 @@ def run_long_video(video, job_id, mapping, single_speaker, voice_id, source_lang
             require_reference_audio(video)
         except (ValueError, RuntimeError) as exc:
             raise gr.Error(str(exc)) from None
-        if not (source_language or '').strip():
-            raise gr.Error('Enter the language spoken in the video.')
+        try:
+            render_settings = long_render_settings(dict(zip(LONG_RENDER_DEFAULTS, render_values)))
+        except (TypeError, ValueError) as exc:
+            raise gr.Error(str(exc)) from None
         job_id = uuid.uuid4().hex
         job = JOBS / job_id
         job.mkdir(parents=True)
         options = job / 'options.json'
         save_json(options, {
             'single_speaker': single_speaker, 'voice_id': (voice_id or '').strip() if single_speaker else '',
-            'source_language': source_language.strip(), 'target_language': target_language, 'speed': speed,
+            'source_language': (source_language or '').strip().lower() or AUTO_LANGUAGE,
+            'target_language': target_language, 'speed': speed,
             'duration': float(duration or 0), 'steps': int(steps), 'batch_frames': int(frames),
             'restore_background': restore_background, 'background_gain': background_gain,
+            **render_settings,
         })
         command += ['--video', video, '--options', str(options)]
     command += ['--job', job_id]
-    if mapping:
-        command += ['--speaker-map', mapping]
     log_path = job / f'run_{uuid.uuid4().hex}.log'
     process = None
-    yield job_id, None, None, f'Long-video job {job_id}. Keep this ID to resume the job.'
+    yield job_id, None, f'Long-video job {job_id}. Keep this ID to resume the job.'
     try:
         with log_path.open('wb') as log:
             process = subprocess.Popen(
@@ -197,20 +206,17 @@ def run_long_video(video, job_id, mapping, single_speaker, voice_id, source_lang
                 with log_path.open('rb') as read:
                     read.seek(max(0, log_path.stat().st_size - 3500))
                     tail = read.read().decode('utf-8', errors='replace')
-                yield job_id, gr.skip(), gr.skip(), tail or 'Preparing long-video job...'
+                yield job_id, gr.skip(), tail or 'Preparing long-video job...'
                 time.sleep(2)
         if process.returncode:
             with log_path.open('rb') as read:
                 read.seek(max(0, log_path.stat().st_size - 3500))
                 tail = read.read().decode('utf-8', errors='replace')
-            yield job_id, None, None, f'Job stopped. Use the same job ID to resume.\n{tail}'
+            yield job_id, None, f'Job stopped. Use the same job ID to resume.\n{tail}'
         elif (job / 'completed.json').is_file():
-            yield job_id, None, str(job / 'output.mp4'), 'Long-video output is ready.'
+            yield job_id, str(job / 'output.mp4'), 'Long-video output is ready.'
         else:
-            yield job_id, str(job / 'speaker_review.zip'), None, (
-                'Download the review bundle. Match the samples to people, fill in the speaker map JSON, '
-                'then upload that JSON and run again with the same job ID.'
-            )
+            yield job_id, None, f'Job stopped before export. Use job ID {job_id} to resume. Log: {log_path}'
     finally:
         stop_worker(process)
 
@@ -306,91 +312,82 @@ def run_standard_render(job):
 
 def build_ui():
     with gr.Blocks(title='Lipsyncstudio') as demo:
-        gr.Markdown('# Lipsyncstudio - LatentSync 1.5')
-        gr.Markdown('Transcribe the original video with 60db, translate it into your target language, select a replacement voice, and lip-sync in roughly five-second chunks. Replacement utterances are fitted to their original time slots, preserving pauses. The final video combines the complete speech with background sound separated from your original video. Short references repeat to cover the speech.')
+        gr.Markdown('# Lipsyncstudio')
         with gr.Row():
             with gr.Column():
-                source = gr.Radio(['Transcribe reference video', 'API text to speech', 'Upload audio'], value='Transcribe reference video', label='Speech source')
-                target_language = gr.Dropdown(LANGUAGES, value='Hindi', allow_custom_value=True, label='Translate video speech into', info='Applies to transcription mode. Enter another language or choose Original to change only the voice. Choose a replacement voice that supports your target language.')
-                with gr.Group() as reference_voice_group:
-                    use_reference_voice = gr.Checkbox(
-                        value=True, label='Dub in the uploaded speaker’s voice',
-                        info='Sends up to the first 10 seconds of audio to 60db. Use clear speech from one speaker. To reuse a dashboard clone, turn this off and select it below.',
-                    )
-                    source_language = gr.Textbox(value='en', label='Language spoken in the video', info='Enter the source language code, such as en or hi.')
-                    multiple_speakers = gr.Checkbox(
-                        value=False, label='Clone each speaker separately',
-                        info='Use this for dialogue with multiple speakers. 60db identifies the speakers and the app creates one clone per speaker.',
-                    )
-                with gr.Group() as text_group:
-                    text = gr.Textbox(visible=False, label='Text to speak', lines=6, placeholder='Enter the speech for your video...')
-                    voice = gr.Dropdown(label='60db voice', choices=[('Current voice', DEFAULT_VOICE)], value=DEFAULT_VOICE, allow_custom_value=True, info='Select a discovered voice or enter a voice ID.')
-                    refresh = gr.Button('Refresh voices')
-                    voice_status = gr.Textbox(label='Voice service', interactive=False)
-                    speed = gr.Slider(0.5, 2.0, value=1.0, step=0.05, label='Speaking speed')
-                    preview = gr.Button('Preview selected voice')
-                    voice_sample = gr.Audio(label='Selected voice preview', type='filepath', interactive=False)
-                    with gr.Accordion('Clone a voice with 60db', open=False):
-                        clone_name = gr.Textbox(label='Voice name')
-                        clone_language = gr.Textbox(label='Source language code', placeholder='en')
-                        clone_samples = gr.File(
-                            label='Original recording of the speaker',
-                            file_types=['.wav', '.mp3', '.flac'],
-                        )
-                        gr.Markdown('Upload a clear recording of one speaker. A short sample can be submitted on its own.')
-                        clone = gr.Button('Create voice clone')
-                        clone_status = gr.Textbox(label='Clone status and reusable voice ID', interactive=False)
-                with gr.Group(visible=False) as audio_group:
-                    audio = gr.Audio(label='Speech audio', sources=['upload', 'microphone'], type='filepath')
                 video = gr.Video(label='Reference video', sources=['upload'])
-                cleanup = gr.Checkbox(value=True, label='Clean steady noise from uploaded speech with SoX', info='Uses a detected quiet section. Skipped for API speech or when no suitable noise reference exists.')
+                with gr.Row():
+                    source_language = gr.Dropdown(
+                        SOURCE_LANGUAGES, value=AUTO_LANGUAGE, allow_custom_value=True,
+                        label='Language spoken in the video',
+                    )
+                    target_language = gr.Dropdown(
+                        LANGUAGES, value='Hindi', allow_custom_value=True, label='Translate video speech into',
+                    )
+                long_single = gr.Checkbox(label='Only one speaker in the entire video', value=False)
+                long_voice = gr.Textbox(label='Existing 60db synthesis voice ID (optional, single speaker only)')
+                speed = gr.Slider(0.5, 2.0, value=1.0, step=0.05, label='Speaking speed')
                 restore_background = gr.Checkbox(value=True, label='Restore original background music / noise')
-                background_gain = gr.Slider(0, 1, value=1, step=0.05, label='Background volume', info='1 keeps the separated background at its original level. Original vocals are excluded; some separation leakage can remain.')
-                duration = gr.Slider(0, 120, value=0, step=1, label='Render length limit (seconds)', info='0 processes the full video in transcription mode, or full speech in other modes. A limit also shortens the transcription input.')
-                steps = gr.Slider(2, 50, value=20, step=1, label='Inference steps', info='20 is a useful starting point. More steps take longer.')
-                frames = gr.Dropdown([4, 8, 16], value=16, label='Frames per batch', info='16 passed our local test. Try 4 or 8 if GPU memory runs out.')
-                run = gr.Button('Generate lip-synced video', variant='primary')
-                with gr.Accordion('Resume standard render', open=False):
-                    standard_job = gr.Textbox(label='Standard render job ID')
-                    standard_resume = gr.Button('Resume standard render')
-                with gr.Accordion('Long-video dubbing', open=False):
-                    gr.Markdown('Uses the reference video, target language, and render settings above. Processes sections of about five minutes with 10–25 second render clips.')
-                    long_job = gr.Textbox(label='Long-video job ID', info='Leave blank for a new job. Keep the generated ID to resume.')
-                    long_single = gr.Checkbox(label='Only one speaker in the entire video', value=False)
-                    long_voice = gr.Textbox(label='Existing 60db synthesis voice ID (optional, single speaker only)')
-                    long_duration = gr.Number(value=0, minimum=0, label='Long-video test limit in seconds',
-                                              info='Use 0 for the full video.')
-                    long_map = gr.File(label='Reviewed speaker map', file_types=['.json'])
-                    long_button = gr.Button('Start or resume long-video job')
-                    long_review = gr.File(label='Speaker review bundle', interactive=False)
-                    long_status = gr.Textbox(label='Long-video progress', interactive=False, lines=8)
+                background_gain = gr.Slider(0, 1, value=1, step=0.05, label='Background volume')
+
             with gr.Column():
-                transcript_output = gr.Textbox(label='Original and translated transcript', lines=10, interactive=False)
-                speech_output = gr.Audio(label='Speech used for this video', type='filepath', interactive=False)
-                output = gr.Video(label='Generated video')
-                status = gr.Textbox(label='Render status', lines=12, interactive=False)
-        source.change(lambda selected: (gr.update(visible=selected != 'Upload audio'),
-                                        gr.update(visible=selected == 'Upload audio'),
-                                        gr.update(visible=selected == 'API text to speech'),
-                                        gr.update(visible=selected == 'Transcribe reference video'),
-                                        gr.update(visible=selected == 'Transcribe reference video')),
-                      inputs=[source], outputs=[text_group, audio_group, text, target_language, reference_voice_group], queue=False)
-        refresh.click(refresh_voices, inputs=[voice], outputs=[voice, voice_status], concurrency_id='pipeline', api_name='refresh_voices')
-        demo.load(refresh_voices, inputs=[voice], outputs=[voice, voice_status], concurrency_id='pipeline', api_name=False)
-        preview.click(preview_voice, inputs=[voice, text, speed], outputs=[voice_sample], concurrency_id='pipeline', api_name='preview_voice')
-        clone.click(clone_voice, inputs=[clone_name, clone_samples, clone_language],
-                    outputs=[voice, clone_status], concurrency_id='pipeline', api_name='clone_voice')
-        voice.change(lambda: None, outputs=[voice_sample], queue=False)
-        run.click(generate_with_speech, inputs=[source, text, voice, video, audio, duration, steps, frames,
-                                               restore_background, background_gain, speed, cleanup, target_language,
-                                               use_reference_voice, source_language, multiple_speakers],
-                  outputs=[output, speech_output, status, transcript_output], concurrency_id='pipeline', api_name='generate')
-        standard_resume.click(resume_standard_render, inputs=[standard_job], outputs=[output, status],
-                              concurrency_id='pipeline', api_name='resume_standard_render')
+                gr.Markdown('### Sections and render clips')
+                with gr.Row():
+                    section_seconds = gr.Number(
+                        value=LONG_RENDER_DEFAULTS['section_seconds'], minimum=10, maximum=600, precision=0,
+                        label='Transcription section (seconds)',
+                    )
+                    long_duration = gr.Number(
+                        value=0, minimum=0, label='Process only the first N seconds',
+                        info='Use 0 for the full video.',
+                    )
+                with gr.Row():
+                    clip_min = gr.Number(
+                        value=LONG_RENDER_DEFAULTS['clip_min_seconds'], minimum=4, maximum=25,
+                        label='Minimum clip (seconds)',
+                    )
+                    clip_target = gr.Number(
+                        value=LONG_RENDER_DEFAULTS['clip_target_seconds'], minimum=4, maximum=25,
+                        label='Target clip (seconds)',
+                    )
+                    clip_max = gr.Number(
+                        value=LONG_RENDER_DEFAULTS['clip_max_seconds'], minimum=4, maximum=25,
+                        label='Maximum clip (seconds)',
+                    )
+                overlap = gr.Slider(
+                    0, 1.5, step=0.04, value=LONG_RENDER_DEFAULTS['overlap_seconds'],
+                    label='Clip overlap (seconds per side)',
+                )
+                with gr.Row():
+                    boundary_search = gr.Slider(
+                        0, 30, step=1, value=LONG_RENDER_DEFAULTS['boundary_search_seconds'],
+                        label='Section pause search (seconds per side)', info='Use 0 for fixed section cuts.',
+                    )
+                    vad_pause = gr.Slider(
+                        0.1, 2, step=0.05, value=LONG_RENDER_DEFAULTS['vad_pause_seconds'],
+                        label='Minimum VAD pause (seconds)',
+                    )
+                gr.Markdown('### Compute')
+                with gr.Row():
+                    steps = gr.Slider(2, 50, value=20, step=1, label='Inference steps')
+                    frames = gr.Dropdown([4, 8, 16], value=16, label='Frames per batch',
+                                         info='Choose 4 or 8 to reduce VRAM use.')
+                    cpu_threads = gr.Slider(
+                        1, 16, step=1, value=LONG_RENDER_DEFAULTS['cpu_threads'], label='PyTorch CPU threads',
+                    )
+
+        long_job = gr.Textbox(label='Job ID', info='Leave blank for a new job. Resume uses the saved settings.')
+        long_button = gr.Button('Start or resume job', variant='primary')
+        with gr.Row():
+            long_status = gr.Textbox(label='Job progress', interactive=False, lines=8)
+            output = gr.Video(label='Generated video', interactive=False)
+
         long_button.click(
-            run_long_video, inputs=[video, long_job, long_map, long_single, long_voice, source_language,
-                                    target_language, speed, long_duration, steps, frames, restore_background, background_gain],
-            outputs=[long_job, long_review, output, long_status], concurrency_id='pipeline', api_name='long_video',
+            run_long_video, inputs=[video, long_job, long_single, long_voice, source_language,
+                                    target_language, speed, long_duration, steps, frames, restore_background, background_gain,
+                                    section_seconds, boundary_search, vad_pause, clip_min, clip_target, clip_max, overlap,
+                                    cpu_threads],
+            outputs=[long_job, output, long_status], concurrency_id='pipeline', api_name='long_video',
             show_progress='minimal',
         )
     return demo

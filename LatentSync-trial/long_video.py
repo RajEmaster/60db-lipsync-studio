@@ -2,25 +2,56 @@
 import argparse
 from contextlib import contextmanager
 import json
+import math
 import msvcrt
 import os
 from pathlib import Path
 import shutil
 import subprocess
 import sys
-from zipfile import ZIP_DEFLATED, ZipFile
 
 import soundfile as sf
 
 from chunk_video import FPS, RATE, probe, run
 from render_chunks import frame_count, save_json, valid_render
+from speaker_matching import match_speakers
 from voice_replacement import clone_reference_voice, replace_voice, speaker_turns
 from vad import detect_speech
 from worker_lifecycle import watch_parent
 
 ROOT = Path(__file__).resolve().parent
 JOBS = ROOT / 'local_jobs' / 'long'
-SECTION_FRAMES = 300 * FPS
+LONG_RENDER_DEFAULTS = {
+    'section_seconds': 300, 'boundary_search_seconds': 12, 'vad_pause_seconds': 0.3,
+    'clip_min_seconds': 10, 'clip_target_seconds': 17, 'clip_max_seconds': 25,
+    'overlap_seconds': 0.4, 'cpu_threads': 4,
+}
+
+
+def long_render_settings(values):
+    try:
+        settings = {key: float(values.get(key, default)) for key, default in LONG_RENDER_DEFAULTS.items()}
+    except (TypeError, ValueError):
+        raise ValueError('Enter a number for each section and render setting.') from None
+    if not all(math.isfinite(value) for value in settings.values()):
+        raise ValueError('Enter finite values for the section and render settings.')
+    if not 10 <= settings['section_seconds'] <= 600:
+        raise ValueError('Set transcription sections between 10 and 600 seconds.')
+    if not 0 <= settings['boundary_search_seconds'] <= 30:
+        raise ValueError('Set the section pause search between 0 and 30 seconds.')
+    if not 0.1 <= settings['vad_pause_seconds'] <= 2:
+        raise ValueError('Set the minimum VAD pause between 0.1 and 2 seconds.')
+    minimum, target, maximum = (settings[f'clip_{key}_seconds'] for key in ('min', 'target', 'max'))
+    if not 4 <= minimum <= target <= maximum <= 25:
+        raise ValueError('Use 4 ≤ minimum clip length ≤ target clip length ≤ maximum clip length ≤ 25 seconds.')
+    overlap = settings['overlap_seconds']
+    if not 0 <= overlap <= 1.5 or 2 * round(overlap * FPS) >= math.ceil(minimum * FPS):
+        raise ValueError('Use 0 to 1.5 seconds of overlap per side and less than half the minimum clip length.')
+    threads = settings['cpu_threads']
+    if not 1 <= threads <= 16 or not threads.is_integer():
+        raise ValueError('Choose a whole number of CPU worker threads from 1 to 16.')
+    settings['cpu_threads'] = int(threads)
+    return settings
 
 
 def read_json(path):
@@ -46,6 +77,7 @@ def job_lock(job):
 
 
 def start_job(job, video, options):
+    options = {**options, **long_render_settings(options)}
     info = probe(video)
     stream = next((s for s in info['streams'] if s['codec_type'] == 'video'), None)
     if stream is None or not any(s['codec_type'] == 'audio' for s in info['streams']):
@@ -96,11 +128,15 @@ def section_boundaries(job, config):
         return read_json(path)
     bounds = [0]
     total = config['frames']
-    radius = min(12 * FPS, SECTION_FRAMES // 4)
-    for nominal in range(SECTION_FRAMES, total, SECTION_FRAMES):
+    section_frames = round(config['section_seconds'] * FPS)
+    radius = min(round(config['boundary_search_seconds'] * FPS), section_frames // 4)
+    for nominal in range(section_frames, total, section_frames):
         # Keep a short final tail with the preceding section.
         if total - nominal < radius:
             break
+        if not radius:
+            bounds.append(nominal)
+            continue
         first = nominal - radius
         window = job / 'boundary_audio.wav'
         run(['ffmpeg', '-hide_banner', '-loglevel', 'error', '-y', '-ss', str(first / FPS),
@@ -108,7 +144,7 @@ def section_boundaries(job, config):
              '-ac', '1', '-ar', str(RATE), '-c:a', 'pcm_s16le', str(window)])
         candidates = []
         if sf.info(window).frames:
-            for start, end in detect_speech(window)['pause_intervals']:
+            for start, end in detect_speech(window, minimum_pause=config['vad_pause_seconds'])['pause_intervals']:
                 candidates.append(first + round(max(start, min(end, radius / FPS)) * FPS))
         bounds.append(min(candidates, key=lambda frame: abs(frame - nominal)) if candidates else nominal)
     bounds.append(total)
@@ -156,36 +192,21 @@ def prepare_sections(job, config):
     return sections, observations
 
 
-def speaker_map(job, config, observations, mapping_file):
+def speaker_map(job, config, observations):
     keys = {item['turn_label'] for item in observations}
-    approved = job / 'speaker_map.json'
-    template = job / 'speaker_map_template.json'
-    if approved.exists():
-        mapping = read_json(approved)
-        if mapping_file and read_json(mapping_file) != mapping:
-            raise ValueError('This job already has an approved speaker map. Start a new job to change it.')
-    elif mapping_file:
-        mapping = read_json(mapping_file)
+    path = job / 'speaker_map.json'
+    if path.exists():
+        mapping = read_json(path)
     elif config['single_speaker']:
         mapping = dict.fromkeys(sorted(keys), 'Speaker 1')
-    elif not keys:
-        mapping = {}
     else:
-        save_json(template, dict.fromkeys(sorted(keys), ''))
-        archive = job / 'speaker_review.tmp'
-        with ZipFile(archive, 'w', compression=ZIP_DEFLATED) as bundle:
-            bundle.write(template, template.name)
-            bundle.write(job / 'speaker_samples.json', 'speaker_samples.json')
-            for item in observations:
-                bundle.write(job / item['sample'], item['sample'])
-        archive.replace(job / 'speaker_review.zip')
-        print('Speaker review required. Listen to the samples and give the same person the same name in the map.', flush=True)
-        return None
+        mapping = match_speakers(job, observations)
     if (not isinstance(mapping, dict) or set(mapping) != keys
             or any(not isinstance(name, str) or not name.strip() for name in mapping.values())):
-        raise ValueError('Fill in every label in the speaker map template, keeping its keys unchanged.')
-    if not approved.exists():
-        save_json(approved, mapping)
+        raise ValueError('The saved speaker map does not match the transcribed turns.')
+    if not path.exists():
+        save_json(path, mapping)
+    print(f'Using {len(set(mapping.values()))} speaker identities.', flush=True)
     return mapping
 
 
@@ -248,7 +269,12 @@ def render_section(section, reference, frames, turns, config, mapping, voices):
                '--job', str(section.relative_to(ROOT)), '--video', str(reference),
                '--audio', str(audio), '--parent-pid', str(os.getpid()),
                '--steps', str(config['steps']), '--frames', str(config['batch_frames']),
-               '--resume', '--min-seconds', '10', '--target-seconds', '17', '--max-seconds', '25']
+               '--resume', '--min-seconds', str(config['clip_min_seconds']),
+               '--target-seconds', str(config['clip_target_seconds']),
+               '--max-seconds', str(config['clip_max_seconds']),
+               '--overlap', str(config['overlap_seconds']),
+               '--vad-pause-seconds', str(config['vad_pause_seconds']),
+               '--cpu-threads', str(config['cpu_threads'])]
     if config['restore_background']:
         command += ['--background-video', str(reference), '--background-gain', str(config['background_gain'])]
     subprocess.run(command, cwd=ROOT, check=True)
@@ -307,7 +333,6 @@ def main():
     parser.add_argument('--job', required=True)
     parser.add_argument('--video')
     parser.add_argument('--options')
-    parser.add_argument('--speaker-map', type=Path)
     parser.add_argument('--parent-pid', type=int)
     args = parser.parse_args()
     if args.parent_pid:
@@ -325,14 +350,13 @@ def main():
                 parser.error('This job needs its original upload and options.')
             start_job(job, args.video, read_json(Path(args.options)))
         config = read_json(job / 'job.json')
+        config.update(long_render_settings(config))
         if ((job / 'completed.json').exists() and (job / 'transcript.json').exists()
                 and valid_render(job / 'output.mp4', config['frames'], exact=True)):
             print(f'Completed output: {job / "output.mp4"}', flush=True)
             return
         sections, observations = prepare_sections(job, config)
-        mapping = speaker_map(job, config, observations, args.speaker_map)
-        if mapping is None:
-            return
+        mapping = speaker_map(job, config, observations)
         voices = resolve_voices(job, config, mapping, observations)
         rendered = [render_section(section, reference, frames, turns, config, mapping, voices)
                     for section, reference, frames, turns in sections]
