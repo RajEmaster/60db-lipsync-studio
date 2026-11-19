@@ -257,7 +257,7 @@ class LipsyncPipeline(DiffusionPipeline):
         print(f"Affine transforming {len(video_frames)} faces...")
         for frame in tqdm.tqdm(video_frames):
             try:
-                face, box, affine_matrix = self.image_processor.affine_transform(frame)
+                face, box, affine_matrix = self.image_processor.affine_transform(frame, include_mouth=True)
             except FaceNotDetected:
                 face, box, affine_matrix = None, None, None
                 self.image_processor.restorer.p_bias = None
@@ -272,13 +272,15 @@ class LipsyncPipeline(DiffusionPipeline):
         out_frames = []
         print(f"Restoring {len(faces)} faces...")
         for index, face in enumerate(tqdm.tqdm(faces)):
-            x1, y1, x2, y2 = boxes[index]
+            (x1, y1, x2, y2), mouth = boxes[index]
             height = int(y2 - y1)
             width = int(x2 - x1)
             face = torchvision.transforms.functional.resize(
                 face, size=(height, width), interpolation=transforms.InterpolationMode.BICUBIC, antialias=True
             )
-            out_frame = self.image_processor.restorer.restore_img(video_frames[index], face, affine_matrices[index])
+            out_frame = self.image_processor.restorer.restore_mouth(
+                video_frames[index], face, affine_matrices[index], mouth
+            )
             out_frames.append(out_frame)
         return np.stack(out_frames, axis=0)
 

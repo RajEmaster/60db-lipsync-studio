@@ -11,6 +11,7 @@ from settings import WORKER_PYTHON
 from speech_cleanup import clean_speech
 
 from chunk_video import chunk_video, probe, run
+from job_logging import log_event
 from audio_pipeline import speech_timestamps, extract_background, build_soundtrack
 
 ROOT = Path(__file__).resolve().parent
@@ -110,7 +111,7 @@ def main():
     audio_duration = float(probe(audio)['format']['duration'])
     video_duration = float(probe(video)['format']['duration'])
     if video_duration + 1 / 25 < audio_duration:
-        print('Extending the reference video by looping it to cover the full speech...', flush=True)
+        log_event('Extending the reference video by looping it to cover the full speech.')
         extended = job / 'extended_reference.mp4'
         run(['ffmpeg', '-hide_banner', '-loglevel', 'error', '-y', '-stream_loop', '-1',
              '-i', str(video), '-an', '-t', str(audio_duration), '-vf', 'fps=25',
@@ -125,18 +126,26 @@ def main():
     if background and not background.is_file() and not args.background_video:
         raise RuntimeError('The saved background track is missing and the original is unavailable.')
     if args.background_video and (not background_saved or (background and not background.is_file())):
+        background_started = time.monotonic()
+        log_event('Background separation started.')
         background = extract_background(args.background_video, job, audio_duration, args.cpu_threads)
+        log_event(f'Background preparation finished in {time.monotonic() - background_started:.1f}s.')
         if args.resume:
             save_json(marker, background.relative_to(job).as_posix() if background else None)
+    elif background_saved:
+        log_event('Reused saved background preparation.')
     plan = job / 'chunk_plan.json'
     if args.resume and plan.exists():
         manifest_path = job / json.loads(plan.read_text(encoding='utf-8'))
         manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+        log_event('Reused saved render clip plan.')
     else:
-        print('Finding confirmed speech pauses with RealtimeVAD...', flush=True)
+        vad_started = time.monotonic()
+        log_event('Finding confirmed speech pauses with RealtimeVAD.')
         timing = speech_timestamps(audio, job, args.vad_pause_seconds)
-        print(f'Splitting near {args.target_seconds:g}s with RealtimeVAD gaps and '
-              f'{args.overlap:g}s context per side...', flush=True)
+        log_event(f'RealtimeVAD finished in {time.monotonic() - vad_started:.1f}s.')
+        clips_started = time.monotonic()
+        log_event(f'Preparing clips near {args.target_seconds:g}s with {args.overlap:g}s context per side.')
         chunk_dir = job / 'chunks'
         if args.resume and chunk_dir.exists():
             chunk_dir = job / f'chunks_{uuid.uuid4().hex}'
@@ -161,6 +170,7 @@ def main():
         save_json(manifest_path, manifest)
         if args.resume:
             save_json(plan, manifest_path.relative_to(job.resolve()).as_posix())
+        log_event(f'Prepared {len(manifest["chunks"])} clips in {time.monotonic() - clips_started:.1f}s.')
     renders = job / 'renders'
     renders.mkdir(exist_ok=True)
     rendered, stats = [], []
@@ -177,11 +187,12 @@ def main():
             if saved.get('frames_per_batch') == args.frames and saved.get('steps') == args.steps:
                 rendered.append(output)
                 stats.append(saved)
-                print(f'Reusing completed chunk {index}/{len(manifest["chunks"])}.', flush=True)
+                log_event(f'Reusing completed chunk {index}/{len(manifest["chunks"])}.')
                 continue
         stats_path.unlink(missing_ok=True)
-        print(f"Rendering chunk {index}/{len(manifest['chunks'])}: {chunk['clip_duration_seconds']:.2f}s "
-              f"(final timeline {chunk['core_start_seconds']:.2f}–{chunk['core_end_seconds']:.2f}s)", flush=True)
+        log_event(f"Rendering chunk {index}/{len(manifest['chunks'])}: {chunk['clip_duration_seconds']:.2f}s "
+                  f"(section timeline {chunk['core_start_seconds']:.2f}–{chunk['core_end_seconds']:.2f}s)")
+        chunk_started = time.monotonic()
         command = [str(WORKER_PYTHON), '-u', str(ROOT / 'trial_inference.py'),
                    '--video', (manifest_path.parent / chunk['video']).resolve().relative_to(ROOT).as_posix(),
                    '--audio', (manifest_path.parent / chunk['audio']).resolve().relative_to(ROOT).as_posix(),
@@ -195,12 +206,15 @@ def main():
                                log_path.read_text(encoding='utf-8', errors='replace')[-3500:])
         rendered.append(output)
         stats.append(json.loads(stats_path.read_text(encoding='utf-8')))
-        print(f'Chunk {index} saved. Worker exited and released its memory.', flush=True)
-    print('Trimming overlap and joining the final video with the continuous speech track...', flush=True)
+        log_event(f'Chunk {index} saved in {time.monotonic() - chunk_started:.1f}s. '
+                  'Worker exited and released its memory.')
+    mux_started = time.monotonic()
+    log_event('Trimming overlap and joining the video with the continuous speech track.')
     output = job / 'output.mp4'
     soundtrack = build_soundtrack(manifest_path.parent / manifest['full_audio'], background,
                                   job / 'final_soundtrack.wav', manifest['duration_seconds'], args.background_gain)
     join_chunks(manifest_path, rendered, output, soundtrack)
+    log_event(f'Soundtrack mix, clip join, and mux finished in {time.monotonic() - mux_started:.1f}s.')
     summary = {'output': str(output), 'seconds': round(time.monotonic() - started, 2),
                'peak_cuda_reserved_mib': max(s['peak_cuda_reserved_mib'] for s in stats),
                'chunks': len(rendered), 'duration_seconds': manifest['duration_seconds'],

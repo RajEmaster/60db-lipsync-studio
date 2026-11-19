@@ -13,7 +13,7 @@ from chunk_video import probe
 from tts_api import AUTO_LANGUAGE, create_cloned_voice, sdk_client, synthesize, DEFAULT_VOICE, list_voices
 from voice_replacement import clone_reference_voice, replace_voice
 from translation import LANGUAGES, ORIGINAL_LANGUAGE
-from long_video import JOBS, LONG_RENDER_DEFAULTS, long_render_settings
+from long_video import JOBS, LONG_RENDER_DEFAULTS, clip_lengths_with_cap, long_render_settings
 from render_chunks import save_json, valid_render
 
 ROOT = Path(__file__).resolve().parent
@@ -214,7 +214,7 @@ def run_long_video(video, job_id, single_speaker, voice_id, source_language,
                 tail = read.read().decode('utf-8', errors='replace')
             yield job_id, None, f'Job stopped. Use the same job ID to resume.\n{tail}'
         elif (job / 'completed.json').is_file():
-            yield job_id, str(job / 'output.mp4'), 'Long-video output is ready.'
+            yield job_id, str(job / 'output.mp4'), f'Long-video output is ready.\nLog: {log_path}'
         else:
             yield job_id, None, f'Job stopped before export. Use job ID {job_id} to resume. Log: {log_path}'
     finally:
@@ -310,6 +310,12 @@ def run_standard_render(job):
         stop_worker(process)
 
 
+def adjust_clip_controls(minimum, target, maximum):
+    if minimum is None or target is None:
+        return gr.skip(), gr.skip()
+    return clip_lengths_with_cap(minimum, target, maximum)
+
+
 def build_ui():
     with gr.Blocks(title='Lipsyncstudio') as demo:
         gr.Markdown('# Lipsyncstudio')
@@ -350,9 +356,9 @@ def build_ui():
                         value=LONG_RENDER_DEFAULTS['clip_target_seconds'], minimum=4, maximum=25,
                         label='Target clip (seconds)',
                     )
-                    clip_max = gr.Number(
-                        value=LONG_RENDER_DEFAULTS['clip_max_seconds'], minimum=4, maximum=25,
-                        label='Maximum clip (seconds)',
+                    clip_max = gr.Slider(
+                        4, 25, step=0.04, value=LONG_RENDER_DEFAULTS['clip_max_seconds'],
+                        label='Maximum clip (seconds)', info='Hard limit including overlap.',
                     )
                 overlap = gr.Slider(
                     0, 1.5, step=0.04, value=LONG_RENDER_DEFAULTS['overlap_seconds'],
@@ -382,6 +388,8 @@ def build_ui():
             long_status = gr.Textbox(label='Job progress', interactive=False, lines=8)
             output = gr.Video(label='Generated video', interactive=False)
 
+        clip_max.input(adjust_clip_controls, inputs=[clip_min, clip_target, clip_max],
+                       outputs=[clip_min, clip_target], queue=False, api_name=False)
         long_button.click(
             run_long_video, inputs=[video, long_job, long_single, long_voice, source_language,
                                     target_language, speed, long_duration, steps, frames, restore_background, background_gain,

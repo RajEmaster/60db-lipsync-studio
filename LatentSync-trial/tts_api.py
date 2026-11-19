@@ -6,12 +6,14 @@ from pathlib import Path
 import uuid
 import wave
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 
 import requests
 import soundfile as sf
 from sixtydb import SixtyDBClient
 from dotenv import load_dotenv
+from voice_slots import recycle_voice_slot
+from worker_lifecycle import exclusive_job_resource
 
 ROOT = Path(__file__).resolve().parent
 load_dotenv(ROOT / '.env')
@@ -90,13 +92,8 @@ def sdk_client():
     except requests.Timeout:
         raise RuntimeError('60db SDK request timed out. Please retry.') from None
     except requests.HTTPError as exc:
-        if exc.response.status_code == 403:
-            try:
-                error = exc.response.json()
-            except ValueError:
-                error = {}
-            if isinstance(error, dict) and error.get('code') == 'VOICE_LIMIT_REACHED':
-                raise RuntimeError('The 60db workspace has reached its custom voice limit.') from None
+        if is_voice_limit(exc):
+            raise RuntimeError('The 60db workspace has reached its custom voice limit.') from None
         raise RuntimeError(f'60db SDK returned HTTP {exc.response.status_code}. Check your key, voice ID, and account limits.') from None
     except Exception as exc:
         message = str(exc).replace(key, '[redacted]')
@@ -105,7 +102,17 @@ def sdk_client():
         client.session.close()
 
 
-def create_cloned_voice(name, sample_path, language):
+def is_voice_limit(error):
+    if error.response.status_code != 403:
+        return False
+    try:
+        body = error.response.json()
+    except ValueError:
+        return False
+    return isinstance(body, dict) and body.get('code') == 'VOICE_LIMIT_REACHED'
+
+
+def create_cloned_voice(name, sample_path, language, recycle=False):
     name, language = name.strip(), language.strip()
     if not name or not language:
         raise ValueError('Enter a voice name and the source language code.')
@@ -116,15 +123,25 @@ def create_cloned_voice(name, sample_path, language):
     if not path.is_file() or path.suffix.lower() not in content_types:
         raise ValueError(f'Provide an existing WAV, MP3, or FLAC file: {path.name}')
 
-    with path.open('rb') as audio, sdk_client() as client:
+    lock = (exclusive_job_resource('voice_slots.lock', 'Waiting for another clone request…')
+            if recycle else nullcontext())
+    with lock, path.open('rb') as audio, sdk_client() as client:
         workspace = os.environ.get('SIXTYDB_WORKSPACE_ID', '').strip()
         if not workspace:
             workspaces = client.get_workspaces()['data']
             if len(workspaces) != 1:
                 raise ValueError('Set SIXTYDB_WORKSPACE_ID to the numeric workspace ID where the clone should be saved.')
             workspace = workspaces[0]['id']
-        result = client.create_voice(name, (path.name, audio, content_types[path.suffix.lower()]),
-                                     language=language, gender='neutral', workspace_id=workspace)
+        upload = (path.name, audio, content_types[path.suffix.lower()])
+        metadata = {'language': language, 'gender': 'neutral', 'workspace_id': workspace}
+        try:
+            result = client.create_voice(name, upload, **metadata)
+        except requests.HTTPError as exc:
+            if not recycle or not is_voice_limit(exc):
+                raise
+            recycle_voice_slot(client, workspace)
+            audio.seek(0)
+            result = client.create_voice(name, upload, **metadata)
     if isinstance(result, dict):
         result = result.get('data', result)
     if not isinstance(result, dict) or not (result.get('id') or result.get('voice_id')):

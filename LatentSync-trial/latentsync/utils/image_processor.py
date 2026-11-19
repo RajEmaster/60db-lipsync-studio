@@ -55,7 +55,7 @@ class ImageProcessor:
         else:
             self.face_detector = FaceDetector(device=device)
 
-    def affine_transform(self, image: torch.Tensor) -> np.ndarray:
+    def affine_transform(self, image: torch.Tensor, include_mouth=False):
         if self.face_detector is None:
             raise NotImplementedError("Using the CPU for face detection is not supported")
         bbox, landmark_2d_106 = self.face_detector(image)
@@ -72,6 +72,9 @@ class ImageProcessor:
         box = [0, 0, face.shape[1], face.shape[0]]  # x1, y1, x2, y2
         face = cv2.resize(face, (self.resolution, self.resolution), interpolation=cv2.INTER_LANCZOS4)
         face = rearrange(torch.from_numpy(face), "h w c -> c h w")
+        if include_mouth:
+            # The InsightFace 106-point model stores the lip contour at indices 52–71.
+            return face, (box, landmark_2d_106[52:72]), affine_matrix
         return face, box, affine_matrix
 
     def preprocess_fixed_mask_image(self, image: torch.Tensor, affine_transform=False):

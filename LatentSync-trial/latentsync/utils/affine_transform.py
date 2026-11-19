@@ -7,6 +7,36 @@ from einops import rearrange
 import kornia
 
 
+def mouth_composite_mask(landmarks, height, width):
+    """Return a feathered, lip-centered mask in a small source-frame region."""
+    left, right = landmarks[0], landmarks[9]
+    direction = right.astype(np.float32) - left
+    mouth_width = np.linalg.norm(direction)
+    if mouth_width < 2:
+        return None
+    horizontal = direction / mouth_width
+    vertical = np.array([-horizontal[1], horizontal[0]])
+    center = (left + right) * 0.5
+    lip_heights = (landmarks - center) @ vertical
+    center += vertical * (lip_heights.min() + lip_heights.max()) * 0.5
+    radius_x = mouth_width * 0.78
+    radius_y = max(mouth_width * 0.50, np.ptp(lip_heights) / 2 + mouth_width * 0.18)
+    extent = max(radius_x, radius_y)
+    x0 = max(0, int(np.floor(center[0] - extent)))
+    y0 = max(0, int(np.floor(center[1] - extent)))
+    x1 = min(width, int(np.ceil(center[0] + extent)) + 1)
+    y1 = min(height, int(np.ceil(center[1] + extent)) + 1)
+    if x1 <= x0 or y1 <= y0:
+        return None
+    y, x = np.ogrid[y0:y1, x0:x1]
+    x, y = x - center[0], y - center[1]
+    u = (x * horizontal[0] + y * horizontal[1]) / radius_x
+    v = (x * vertical[0] + y * vertical[1]) / radius_y
+    falloff = np.clip((1 - np.sqrt(u * u + v * v)) / 0.35, 0, 1)
+    alpha = (0.90 * falloff * falloff * (3 - 2 * falloff)).astype(np.float32)
+    return (x0, y0, x1, y1), alpha
+
+
 class AlignRestore(object):
     def __init__(self, align_points=3, resolution=256, device="cpu", dtype=torch.float16):
         if align_points == 3:
@@ -40,6 +70,25 @@ class AlignRestore(object):
         )
         cropped_face = rearrange(cropped_face.squeeze(0), "c h w -> h w c").cpu().numpy().astype(np.uint8)
         return cropped_face, affine_matrix
+
+    def restore_mouth(self, input_img, face, affine_matrix, mouth):
+        region = mouth_composite_mask(mouth, *input_img.shape[:2])
+        if region is None:
+            return input_img
+        (x0, y0, x1, y1), alpha = region
+        inverse = kornia.geometry.transform.invert_affine_transform(affine_matrix.float())
+        inverse[0, 0, 2] -= x0
+        inverse[0, 1, 2] -= y0
+        generated = kornia.geometry.transform.warp_affine(
+            face.to(device=self.device, dtype=self.dtype).unsqueeze(0),
+            inverse.to(dtype=self.dtype), (y1 - y0, x1 - x0),
+            mode="bilinear", padding_mode="border",
+        )
+        generated = ((generated[0].float() / 2 + 0.5).clamp(0, 1) * 255).permute(1, 2, 0).cpu().numpy()
+        result = input_img.copy()
+        original = input_img[y0:y1, x0:x1]
+        result[y0:y1, x0:x1] = np.rint(original + alpha[..., None] * (generated - original)).astype(np.uint8)
+        return result
 
     def restore_img(self, input_img, face, affine_matrix):
         h, w, _ = input_img.shape

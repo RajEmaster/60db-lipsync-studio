@@ -9,12 +9,12 @@ import psutil
 
 
 @contextmanager
-def exclusive_gpu():
-    """Serialize inference across UI instances; Windows releases the lock on exit."""
+def exclusive_job_resource(filename, waiting_message):
+    """Serialize access across app processes; Windows releases the lock on exit."""
     import msvcrt
     folder = Path(__file__).resolve().parent / 'local_jobs'
     folder.mkdir(exist_ok=True)
-    with (folder / 'gpu.lock').open('a+b') as handle:
+    with (folder / filename).open('a+b') as handle:
         handle.seek(0, 2)
         if handle.tell() == 0:
             handle.write(b'0')
@@ -27,7 +27,7 @@ def exclusive_gpu():
                 break
             except OSError:
                 if not waiting:
-                    print('Another render owns the GPU; waiting for it to finish.', flush=True)
+                    print(waiting_message, flush=True)
                     waiting = True
                 time.sleep(1)
         try:
@@ -35,6 +35,10 @@ def exclusive_gpu():
         finally:
             handle.seek(0)
             msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+
+
+def exclusive_gpu():
+    return exclusive_job_resource('gpu.lock', 'Another render owns the GPU; waiting for it to finish.')
 
 
 def watch_parent(pid):

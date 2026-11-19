@@ -18,8 +18,25 @@ from tts_api import (
 import requests
 from vad import detect_speech
 from translation import translate, ORIGINAL_LANGUAGE
+from worker_lifecycle import exclusive_job_resource
 
 ROOT = Path(__file__).resolve().parent
+CLONE_SPEECH_SECONDS = 10
+CLONE_UPLOAD_SECONDS = 10.1
+
+
+def assemble_clone_sample(turns, output):
+    """Collect up to ten seconds of speech from one speaker's longest turns."""
+    remaining = CLONE_SPEECH_SECONDS * 16000
+    with sf.SoundFile(output, mode='w', samplerate=16000, channels=1, subtype='PCM_16') as joined:
+        for path, first, last in sorted(turns, key=lambda turn: turn[2] - turn[1], reverse=True):
+            with sf.SoundFile(path) as source:
+                source.seek(first)
+                audio = source.read(min(remaining, last - first), dtype='int16')
+            joined.write(audio)
+            remaining -= len(audio)
+            if not remaining:
+                break
 
 
 def reference_clone_record(video, language, sample_key=''):
@@ -44,9 +61,8 @@ def clone_reference_voice(video, language, sample=None, sample_key=''):
     """Yield clone progress and the reusable voice ID once it can be selected."""
     language = (language or AUTO_LANGUAGE).strip().lower() or AUTO_LANGUAGE
     name, record = reference_clone_record(video, language, sample_key)
-    if record.exists():
-        result = json.loads(record.read_text(encoding='utf-8'))
-    else:
+    result = reuse_clone_record(record)
+    if result is None:
         if sample is None:
             yield None, 'Extracting original speaker audio for 60db voice cloning...'
             with TemporaryDirectory(dir=record.parent) as temp:
@@ -96,9 +112,31 @@ def clone_sample(video, name, sample, language, sample_key):
     if language == AUTO_LANGUAGE:
         language = detect_spoken_language(sample)
         name, language_record = reference_clone_record(video, language, sample_key)
-        if language_record.exists():
-            return json.loads(language_record.read_text(encoding='utf-8'))
-    return create_cloned_voice(name, sample, language)
+        cached = reuse_clone_record(language_record)
+        if cached is not None:
+            return cached
+    audio, rate = sf.read(sample, dtype='int16')
+    if not len(audio):
+        raise ValueError('No speaker audio is available to clone.')
+    minimum = round(CLONE_UPLOAD_SECONDS * rate)
+    if len(audio) >= minimum:
+        return create_cloned_voice(name, sample, language, recycle=True)
+    with TemporaryDirectory() as temp:
+        upload = Path(temp) / 'voice_sample.wav'
+        padding = [(0, minimum - len(audio))] + [(0, 0)] * (audio.ndim - 1)
+        sf.write(upload, np.pad(audio, padding), rate, subtype='PCM_16')
+        print(f'Prepared {len(audio) / rate:.2f}s of speaker audio for 60db; '
+              f'padded the upload to {CLONE_UPLOAD_SECONDS:g}s.', flush=True)
+        return create_cloned_voice(name, upload, language, recycle=True)
+
+
+def reuse_clone_record(record):
+    with exclusive_job_resource('voice_slots.lock', 'Waiting for another clone request…'):
+        if not record.is_file():
+            return None
+        result = json.loads(record.read_text(encoding='utf-8'))
+        record.touch()
+        return result
 
 
 def tempo_filters(factor):
@@ -171,7 +209,11 @@ def replace_voice(video, voice, speed=1.0, duration=0, target_language=ORIGINAL_
         for index, (speaker, (first, last)) in enumerate(longest.items(), 1):
             last = min(last, first + 10 * rate)
             sample = folder / f'speaker_{index:03d}.wav'
-            sf.write(sample, source[first:last], rate, subtype='PCM_16')
+            if last - first < CLONE_SPEECH_SECONDS * rate:
+                assemble_clone_sample([(original, start, stop) for start, stop, label, _ in turns
+                                       if label == speaker], sample)
+            else:
+                sf.write(sample, source[first:last], rate, subtype='PCM_16')
             yield None, '', f'Preparing clone {index}/{len(longest)} for {speaker}...'
             for identity, message in clone_reference_voice(video, source_language, sample, f'{speaker}:{first}:{last}'):
                 if identity:
@@ -185,6 +227,7 @@ def replace_voice(video, voice, speed=1.0, duration=0, target_language=ORIGINAL_
         raise ValueError('No speech was detected in the reference video.')
     timeline = np.zeros(len(source), dtype=np.float32)
     segments, lines = [], []
+    synthesis_started = time.monotonic()
     for index, (first, last, speaker, text) in enumerate(turns, 1):
         if last <= first:
             continue
@@ -203,11 +246,16 @@ def replace_voice(video, voice, speed=1.0, duration=0, target_language=ORIGINAL_
         lines.append(f'[{start:.2f}s - {end:.2f}s] {label}: {text}')
         if target_language != ORIGINAL_LANGUAGE:
             yield None, '\n'.join(lines), f'Translating segment {index}/{len(turns)} into {target_language} with 60db...'
+        started = time.monotonic()
         spoken_text = translate(text, target_language)
+        translation_seconds = time.monotonic() - started
         if target_language != ORIGINAL_LANGUAGE:
             lines.append(f'{target_language}: {spoken_text}\n')
         yield None, '\n'.join(lines), f'Generating replacement voice for segment {index}/{len(turns)}...'
+        started = time.monotonic()
         generated = synthesize(spoken_text, voices[speaker] if speaker else voice, speed)
+        tts_seconds = time.monotonic() - started
+        started = time.monotonic()
         info = sf.info(generated)
         target_seconds = (last - first) / rate
         factor = info.duration / target_seconds
@@ -219,6 +267,7 @@ def replace_voice(video, voice, speed=1.0, duration=0, target_language=ORIGINAL_
         if len(audio) != last - first:
             raise RuntimeError('Replacement speech does not match its original timeline slot.')
         timeline[first:last] = audio
+        fitting_seconds = time.monotonic() - started
         segments.append({'start': start, 'end': end, 'text': text,
                          'target_language': target_language, 'spoken_text': spoken_text,
                          'generated_audio': generated, 'tempo_factor': factor})
@@ -226,6 +275,15 @@ def replace_voice(video, voice, speed=1.0, duration=0, target_language=ORIGINAL_
             segments[-1].update(speaker=speaker, voice_id=voices[speaker])
         (folder / 'transcript.json').write_text(json.dumps(segments, indent=2, ensure_ascii=False), encoding='utf-8')
         (folder / 'transcript.txt').write_text('\n'.join(lines), encoding='utf-8')
+        if prepared_turns is not None:
+            elapsed = time.monotonic() - synthesis_started
+            estimated_total = elapsed * len(turns) / index
+            yield None, '\n'.join(lines), (
+                f'Turn {index}/{len(turns)} ready. Translation {translation_seconds:.1f}s, '
+                f'TTS {tts_seconds:.1f}s, timing fit {fitting_seconds:.1f}s. '
+                f'Section synthesis elapsed {elapsed:.1f}s, estimated total {estimated_total:.1f}s, '
+                f'remaining {max(0, estimated_total - elapsed):.1f}s.'
+            )
     if not segments and prepared_turns is None:
         raise ValueError('60db could not find any transcribable speech in the reference video.')
     output = folder / 'replacement_speech.wav'

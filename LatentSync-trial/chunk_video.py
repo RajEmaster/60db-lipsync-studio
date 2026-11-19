@@ -46,7 +46,8 @@ def silence_intervals(audio, threshold=-35, minimum=0.2):
 
 def plan_chunks(total_frames, minimum=5, maximum=7, target=6, overlap=0.2, silences=()):
     """Bound actual extracted clip lengths, including context, in frame units."""
-    low, high = math.ceil(minimum * FPS), math.floor(maximum * FPS)
+    high = math.floor(maximum * FPS + 1e-8)
+    low = min(math.ceil(minimum * FPS - 1e-8), high)
     padding = round(overlap * FPS)
     if not 0 < low <= high or not minimum <= target <= maximum:
         raise ValueError('Use 0 < min <= target <= max.')
@@ -66,7 +67,11 @@ def plan_chunks(total_frames, minimum=5, maximum=7, target=6, overlap=0.2, silen
         if total_frames <= high:
             feasible = [(1, [total_frames], [total_frames])]
         else:
-            raise ValueError('These length limits cannot cover the input; widen the min/max range.')
+            # The minimum is a preference when the timeline cannot fit under the hard cap.
+            count = math.ceil((total_frames - 2 * padding) / (high - 2 * padding))
+            maximums = [high - padding * ((i > 0) + (i < count - 1)) for i in range(count)]
+            minimums = [min(capacity, total_frames // count) for capacity in maximums]
+            feasible = [(count, minimums, maximums)]
     count, minimums, maximums = min(feasible, key=lambda item: (abs(item[0] - desired), item[0]))
     boundaries, reasons = [0], []
     for index in range(count - 1):

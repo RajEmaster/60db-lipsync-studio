@@ -9,13 +9,15 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import time
 
 import soundfile as sf
 
 from chunk_video import FPS, RATE, probe, run
+from job_logging import log_event
 from render_chunks import frame_count, save_json, valid_render
 from speaker_matching import match_speakers
-from voice_replacement import clone_reference_voice, replace_voice, speaker_turns
+from voice_replacement import CLONE_SPEECH_SECONDS, assemble_clone_sample, clone_reference_voice, replace_voice, speaker_turns
 from vad import detect_speech
 from worker_lifecycle import watch_parent
 
@@ -26,6 +28,11 @@ LONG_RENDER_DEFAULTS = {
     'clip_min_seconds': 10, 'clip_target_seconds': 17, 'clip_max_seconds': 25,
     'overlap_seconds': 0.4, 'cpu_threads': 4,
 }
+
+
+def clip_lengths_with_cap(minimum, target, maximum):
+    minimum = min(minimum, maximum)
+    return minimum, max(minimum, min(target, maximum))
 
 
 def long_render_settings(values):
@@ -42,8 +49,10 @@ def long_render_settings(values):
     if not 0.1 <= settings['vad_pause_seconds'] <= 2:
         raise ValueError('Set the minimum VAD pause between 0.1 and 2 seconds.')
     minimum, target, maximum = (settings[f'clip_{key}_seconds'] for key in ('min', 'target', 'max'))
-    if not 4 <= minimum <= target <= maximum <= 25:
-        raise ValueError('Use 4 ≤ minimum clip length ≤ target clip length ≤ maximum clip length ≤ 25 seconds.')
+    if not all(4 <= value <= 25 for value in (minimum, target, maximum)):
+        raise ValueError('Enter clip lengths between 4 and 25 seconds.')
+    minimum, target = clip_lengths_with_cap(minimum, target, maximum)
+    settings.update(clip_min_seconds=minimum, clip_target_seconds=target)
     overlap = settings['overlap_seconds']
     if not 0 <= overlap <= 1.5 or 2 * round(overlap * FPS) >= math.ceil(minimum * FPS):
         raise ValueError('Use 0 to 1.5 seconds of overlap per side and less than half the minimum clip length.')
@@ -154,19 +163,26 @@ def section_boundaries(job, config):
 
 def prepare_sections(job, config):
     sections, observations = [], []
+    started = time.monotonic()
     bounds = section_boundaries(job, config)
+    log_event(f'Section plan ready in {time.monotonic() - started:.1f}s. {len(bounds) - 1} sections.')
     for index, (start, end) in enumerate(zip(bounds, bounds[1:]), 1):
         frames = end - start
         section = job / f'section_{index:04d}'
-        print(f'Preparing section {index}, starting at {start / FPS:.2f}s...', flush=True)
+        log_event(f'Preparing section {index}, starting at video time {start / FPS:.2f}s…')
+        started = time.monotonic()
         reference, original = take_section(job / config['source'], section, start, frames)
+        log_event(f'{section.name} media ready in {time.monotonic() - started:.1f}s.')
         transcript = section / 'turns.json'
         if transcript.exists():
             turns = read_json(transcript)
+            log_event(f'{section.name} reused its saved transcription ({len(turns)} turns).')
         else:
-            print('Transcribing this section and identifying speaker turns with 60db...', flush=True)
+            log_event(f'{section.name} transcription and speaker diarization started.')
+            started = time.monotonic()
             turns = speaker_turns(original, RATE, frames * (RATE // FPS), config['source_language'])
             save_json(transcript, turns)
+            log_event(f'{section.name} transcription finished in {time.monotonic() - started:.1f}s ({len(turns)} turns).')
         sections.append((section, reference, frames, turns))
         longest = {}
         for first, last, label, _ in turns:
@@ -193,6 +209,7 @@ def prepare_sections(job, config):
 
 
 def speaker_map(job, config, observations):
+    started = time.monotonic()
     keys = {item['turn_label'] for item in observations}
     path = job / 'speaker_map.json'
     if path.exists():
@@ -206,11 +223,12 @@ def speaker_map(job, config, observations):
         raise ValueError('The saved speaker map does not match the transcribed turns.')
     if not path.exists():
         save_json(path, mapping)
-    print(f'Using {len(set(mapping.values()))} speaker identities.', flush=True)
+    log_event(f'Speaker mapping ready in {time.monotonic() - started:.1f}s. '
+              f'Using {len(set(mapping.values()))} identities.')
     return mapping
 
 
-def resolve_voices(job, config, mapping, observations):
+def resolve_voices(job, config, mapping, observations, sections):
     path = job / 'voices.json'
     voices = read_json(path) if path.exists() else {}
     best = {}
@@ -220,25 +238,41 @@ def resolve_voices(job, config, mapping, observations):
             best[identity] = item
     if config.get('voice_id'):
         return dict.fromkeys(best, config['voice_id'])
-    for identity, item in best.items():
+    turns_by_speaker = {}
+    for section, _, _, turns in sections:
+        original = section / 'speech' / 'original_speech.wav'
+        for first, last, label, _ in turns:
+            identity = mapping[f'{section.name}/{label}']
+            turns_by_speaker.setdefault(identity, []).append((original, first, last))
+    for index, (identity, item) in enumerate(best.items(), 1):
         if identity in voices:
             continue
         sample = job / item['sample']
-        print(f'Resolving 60db voice for {identity}...', flush=True)
+        if item['sample_frames'] < CLONE_SPEECH_SECONDS * RATE:
+            directory = job / 'clone_samples'
+            directory.mkdir(exist_ok=True)
+            sample = directory / f'speaker_{index:03d}.wav'
+            temporary = sample.with_suffix('.tmp.wav')
+            assemble_clone_sample(turns_by_speaker[identity], temporary)
+            temporary.replace(sample)
+        log_event(f'Resolving 60db voice for {identity}…')
+        started = time.monotonic()
         for voice_id, message in clone_reference_voice(sample, config['source_language'], sample):
-            print(message, flush=True)
+            log_event(message)
             if voice_id:
                 voices[identity] = voice_id
                 save_json(path, voices)
+        log_event(f'Voice for {identity} ready in {time.monotonic() - started:.1f}s.')
     return voices
 
 
 def render_section(section, reference, frames, turns, config, mapping, voices):
+    section_started = time.monotonic()
     output = section / 'output.mp4'
     soundtrack = section / 'final_soundtrack.wav'
     summary = section / 'output.mp4.json'
     if summary.exists() and soundtrack.is_file() and valid_render(output, frames, exact=True):
-        print(f'Reusing completed {section.name}.', flush=True)
+        log_event(f'Reusing completed {section.name}.')
         return output, soundtrack
     summary.unlink(missing_ok=True)
     if not turns:
@@ -254,17 +288,27 @@ def render_section(section, reference, frames, turns, config, mapping, voices):
         normalize_audio(source, soundtrack, frames, 44100, 2, 'pcm_f32le',
                         config['background_gain'] if config['restore_background'] else 1.0)
         save_json(summary, {'total_frames': frames, 'chunks': 0})
+        log_event(f'{section.name} completed in {time.monotonic() - section_started:.1f}s. No dialogue to synthesize.')
         return output, soundtrack
     dubbing = section / 'dub_ready.json'
     audio = section / 'speech' / 'replacement_speech.wav'
     if not dubbing.is_file() or not audio.is_file():
+        log_event(f'{section.name} synthesis started. {len(turns)} turns across {frames / FPS:.2f}s of video.')
+        synthesis_started = time.monotonic()
         routed = [(first, last, mapping[f'{section.name}/{label}'], text) for first, last, label, text in turns]
         for replacement, _, message in replace_voice(
                 reference, None, config['speed'], target_language=config['target_language'],
                 prepared_turns=routed, speaker_voices=voices, job_folder=audio.parent):
-            print(message, flush=True)
+            log_event(f'{section.name} {message}')
             if replacement:
-                save_json(dubbing, {'samples': sf.info(audio).frames})
+                elapsed = time.monotonic() - synthesis_started
+                save_json(dubbing, {'samples': sf.info(audio).frames, 'synthesis_seconds': round(elapsed, 2)})
+                log_event(f'{section.name} synthesis finished in {elapsed:.1f}s.')
+    else:
+        saved = read_json(dubbing)
+        elapsed = saved.get('synthesis_seconds')
+        timing = f' Original synthesis took {elapsed:.1f}s.' if elapsed is not None else ''
+        log_event(f'{section.name} reused its saved dubbed audio.{timing}')
     command = [sys.executable, '-u', str(ROOT / 'render_chunks.py'),
                '--job', str(section.relative_to(ROOT)), '--video', str(reference),
                '--audio', str(audio), '--parent-pid', str(os.getpid()),
@@ -277,9 +321,13 @@ def render_section(section, reference, frames, turns, config, mapping, voices):
                '--cpu-threads', str(config['cpu_threads'])]
     if config['restore_background']:
         command += ['--background-video', str(reference), '--background-gain', str(config['background_gain'])]
+    log_event(f'{section.name} render and mix started.')
+    started = time.monotonic()
     subprocess.run(command, cwd=ROOT, check=True)
     if not valid_render(output, frames, exact=True):
         raise RuntimeError(f'{section.name} has the wrong number of output frames.')
+    log_event(f'{section.name} render and mix finished in {time.monotonic() - started:.1f}s. '
+              f'Section total {time.monotonic() - section_started:.1f}s after transcription and speaker mapping.')
     return output, soundtrack
 
 
@@ -345,26 +393,37 @@ def main():
     if not job.is_dir():
         parser.error('Long-video job not found.')
     with job_lock(job):
+        started = time.monotonic()
+        log_event(f'Job {args.job} started or resumed.')
         if not (job / 'job.json').exists():
             if not args.video or not args.options:
                 parser.error('This job needs its original upload and options.')
             start_job(job, args.video, read_json(Path(args.options)))
         config = read_json(job / 'job.json')
         config.update(long_render_settings(config))
+        log_event(f'Render clips: {config["clip_min_seconds"]:g}s minimum, '
+                  f'{config["clip_target_seconds"]:g}s target, {config["clip_max_seconds"]:g}s maximum.')
         if ((job / 'completed.json').exists() and (job / 'transcript.json').exists()
                 and valid_render(job / 'output.mp4', config['frames'], exact=True)):
-            print(f'Completed output: {job / "output.mp4"}', flush=True)
+            log_event(f'Reused completed output: {job / "output.mp4"}')
             return
         sections, observations = prepare_sections(job, config)
         mapping = speaker_map(job, config, observations)
-        voices = resolve_voices(job, config, mapping, observations)
+        voices = resolve_voices(job, config, mapping, observations, sections)
         rendered = [render_section(section, reference, frames, turns, config, mapping, voices)
                     for section, reference, frames, turns in sections]
         save_project_transcript(job, sections)
+        log_event('Final assembly started.')
+        assembly_started = time.monotonic()
         output = assemble(job, rendered, config['frames'])
         save_json(job / 'completed.json', {'frames': config['frames'], 'sections': len(sections)})
-        print(f'Completed output: {output}', flush=True)
+        log_event(f'Final assembly finished in {time.monotonic() - assembly_started:.1f}s. '
+                  f'This run took {time.monotonic() - started:.1f}s. Completed output: {output}')
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except Exception as exc:
+        log_event(f'Job stopped: {exc}')
+        raise
