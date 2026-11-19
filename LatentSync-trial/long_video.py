@@ -17,7 +17,11 @@ from chunk_video import FPS, RATE, probe, run
 from job_logging import log_event
 from render_chunks import frame_count, save_json, valid_render
 from speaker_matching import match_speakers
-from voice_replacement import CLONE_SPEECH_SECONDS, assemble_clone_sample, clone_reference_voice, replace_voice, speaker_turns
+from tts_api import sdk_client
+from voice_replacement import (
+    CLONE_SPEECH_SECONDS, MAX_DUB_TURN_SECONDS, assemble_clone_sample, clone_reference_voice, replace_voice,
+    speaker_turns, split_long_speaker_turns,
+)
 from vad import detect_speech
 from worker_lifecycle import watch_parent
 
@@ -112,7 +116,7 @@ def take_section(source, section, start, frames):
         temporary = reference.with_name('reference-partial.mp4')
         run(['ffmpeg', '-hide_banner', '-loglevel', 'error', '-y', '-ss', str(start / FPS),
              '-i', str(source), '-map', '0:v:0', '-map', '0:a:0',
-             '-vf', 'fps=25,tpad=stop_mode=clone:stop_duration=0.08',
+             '-vf', f'fps={FPS}:start_time=0,tpad=stop_mode=clone:stop_duration=0.08',
              '-frames:v', str(frames), '-t', str(frames / FPS), '-c:v', 'libx264',
              '-preset', 'fast', '-crf', '18', '-pix_fmt', 'yuv420p', '-c:a', 'alac', str(temporary)])
         if not valid_render(temporary, frames, exact=True):
@@ -154,7 +158,7 @@ def section_boundaries(job, config):
         candidates = []
         if sf.info(window).frames:
             for start, end in detect_speech(window, minimum_pause=config['vad_pause_seconds'])['pause_intervals']:
-                candidates.append(first + round(max(start, min(end, radius / FPS)) * FPS))
+                candidates.append(first + round((start + end) * 0.5 * FPS))
         bounds.append(min(candidates, key=lambda frame: abs(frame - nominal)) if candidates else nominal)
     bounds.append(total)
     save_json(path, bounds)
@@ -183,6 +187,14 @@ def prepare_sections(job, config):
             turns = speaker_turns(original, RATE, frames * (RATE // FPS), config['source_language'])
             save_json(transcript, turns)
             log_event(f'{section.name} transcription finished in {time.monotonic() - started:.1f}s ({len(turns)} turns).')
+        if (any(last - first > MAX_DUB_TURN_SECONDS * RATE for first, last, _, _ in turns)
+                and not ((section / 'dub_ready.json').is_file() and (section / 'speech/replacement_speech.wav').is_file())):
+            log_event(f'{section.name} refining coarse speaker turns at detected speech pauses.')
+            started = time.monotonic()
+            refined = split_long_speaker_turns(original, turns, config['source_language'])
+            save_json(transcript, refined)
+            turns = refined
+            log_event(f'{section.name} recovered {len(turns)} bounded turns in {time.monotonic() - started:.1f}s.')
         sections.append((section, reference, frames, turns))
         longest = {}
         for first, last, label, _ in turns:
@@ -228,7 +240,7 @@ def speaker_map(job, config, observations):
     return mapping
 
 
-def resolve_voices(job, config, mapping, observations, sections):
+def section_voice_resolver(job, config, mapping, observations, sections):
     path = job / 'voices.json'
     voices = read_json(path) if path.exists() else {}
     best = {}
@@ -237,21 +249,36 @@ def resolve_voices(job, config, mapping, observations, sections):
         if identity not in best or item['sample_frames'] > best[identity]['sample_frames']:
             best[identity] = item
     if config.get('voice_id'):
-        return dict.fromkeys(best, config['voice_id'])
+        return lambda section, identity: config['voice_id']
     turns_by_speaker = {}
     for section, _, _, turns in sections:
         original = section / 'speech' / 'original_speech.wav'
         for first, last, label, _ in turns:
             identity = mapping[f'{section.name}/{label}']
             turns_by_speaker.setdefault(identity, []).append((original, first, last))
-    for index, (identity, item) in enumerate(best.items(), 1):
+    sample_indices = {identity: index for index, identity in enumerate(best, 1)}
+    last_scope = None
+
+    def resolve(section, identity):
+        nonlocal last_scope
+        scope = (section.name, identity)
+        if last_scope == scope:
+            return voices[identity]
+        save_json(job / 'active_voice.json', {'section': section.name, 'speaker': identity})
         if identity in voices:
-            continue
+            with sdk_client() as client:
+                live_ids = {voice.get('voice_provider_id') or voice.get('voice_id')
+                            for voice in client.get_my_voices()['data']}
+            if voices[identity] in live_ids:
+                last_scope = scope
+                return voices[identity]
+            log_event(f'Recreating the recycled clone for {identity}.')
+        item = best[identity]
         sample = job / item['sample']
         if item['sample_frames'] < CLONE_SPEECH_SECONDS * RATE:
             directory = job / 'clone_samples'
             directory.mkdir(exist_ok=True)
-            sample = directory / f'speaker_{index:03d}.wav'
+            sample = directory / f'speaker_{sample_indices[identity]:03d}.wav'
             temporary = sample.with_suffix('.tmp.wav')
             assemble_clone_sample(turns_by_speaker[identity], temporary)
             temporary.replace(sample)
@@ -263,7 +290,10 @@ def resolve_voices(job, config, mapping, observations, sections):
                 voices[identity] = voice_id
                 save_json(path, voices)
         log_event(f'Voice for {identity} ready in {time.monotonic() - started:.1f}s.')
-    return voices
+        last_scope = scope
+        return voices[identity]
+
+    return resolve
 
 
 def render_section(section, reference, frames, turns, config, mapping, voices):
@@ -409,8 +439,9 @@ def main():
             return
         sections, observations = prepare_sections(job, config)
         mapping = speaker_map(job, config, observations)
-        voices = resolve_voices(job, config, mapping, observations, sections)
-        rendered = [render_section(section, reference, frames, turns, config, mapping, voices)
+        resolve = section_voice_resolver(job, config, mapping, observations, sections)
+        rendered = [render_section(section, reference, frames, turns, config, mapping,
+                                   lambda identity, section=section: resolve(section, identity))
                     for section, reference, frames, turns in sections]
         save_project_transcript(job, sections)
         log_event('Final assembly started.')

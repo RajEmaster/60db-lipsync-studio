@@ -195,7 +195,13 @@ def synthesize(text, voice=DEFAULT_VOICE, speed=0.7):
     if not 0.5 <= float(speed) <= 2:
         raise ValueError('Speaking speed must be between 0.5 and 2.')
     with sdk_client() as client:
-        raw = client.text_to_speech(text=text, voice_id=voice, speed=float(speed), output_format='wav')
+        try:
+            raw = client.text_to_speech(text=text, voice_id=voice, speed=float(speed), output_format='wav')
+        except requests.HTTPError as exc:
+            if not 500 <= exc.response.status_code <= 599:
+                raise
+            raise RuntimeError(f'60db TTS returned HTTP {exc.response.status_code} while synthesizing '
+                               f'{len(text)} characters. Resume the job to retry synthesis.') from None
     try:
         if not isinstance(raw, bytes) or not raw:
             raise ValueError()

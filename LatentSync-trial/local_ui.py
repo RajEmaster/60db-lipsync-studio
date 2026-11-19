@@ -70,7 +70,23 @@ def clone_voice(name, sample, language):
 
 
 def require_reference_audio(video):
-    if not any(stream['codec_type'] == 'audio' for stream in probe(video)['streams']):
+    deadline = time.monotonic() + 10
+    while True:
+        try:
+            stream_types = {stream['codec_type'] for stream in probe(video)['streams']}
+            break
+        except RuntimeError as exc:
+            detail = str(exc).lower()
+            # On Windows Gradio may finish copying a re-upload into its cache
+            # after returning the upload response.
+            if not any(message in detail for message in ('moov atom not found', 'no such file', 'permission denied')):
+                raise
+            if time.monotonic() >= deadline:
+                raise ValueError('The uploaded file is incomplete or could not be read. Re-upload the original video.') from exc
+            time.sleep(0.25)
+    if 'video' not in stream_types:
+        raise ValueError('Upload a file with a video track.')
+    if 'audio' not in stream_types:
         raise ValueError(
             'The uploaded video has no audio track. Upload a copy with its original sound '
             'to transcribe, clone voices, or restore background audio.'
@@ -169,7 +185,7 @@ def run_long_video(video, job_id, single_speaker, voice_id, source_language,
                 raise gr.Error('Upload the original video again to finish preparing this job.')
             command += ['--video', video, '--options', str(job / 'options.json')]
     else:
-        if not video or not Path(video).is_file():
+        if not video:
             raise gr.Error('Upload a reference video.')
         try:
             require_reference_audio(video)
@@ -321,7 +337,7 @@ def build_ui():
         gr.Markdown('# Lipsyncstudio')
         with gr.Row():
             with gr.Column():
-                video = gr.Video(label='Reference video', sources=['upload'])
+                video = gr.File(label='Reference video', file_types=['video'], type='filepath')
                 with gr.Row():
                     source_language = gr.Dropdown(
                         SOURCE_LANGUAGES, value=AUTO_LANGUAGE, allow_custom_value=True,
@@ -386,7 +402,7 @@ def build_ui():
         long_button = gr.Button('Start or resume job', variant='primary')
         with gr.Row():
             long_status = gr.Textbox(label='Job progress', interactive=False, lines=8)
-            output = gr.Video(label='Generated video', interactive=False)
+            output = gr.Video(label='Generated video', interactive=False, show_download_button=True)
 
         clip_max.input(adjust_clip_controls, inputs=[clip_min, clip_target, clip_max],
                        outputs=[clip_min, clip_target], queue=False, api_name=False)

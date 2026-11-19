@@ -24,16 +24,20 @@ fit, and saving the dubbed track. The render and soundtrack mix have separate
 timings. The actual synthesis duration is saved in each section's
 `dub_ready.json`.
 
-1. **Plan sections.** Copy the original upload into the job folder. Put section boundaries about five minutes apart on a 25 fps timeline. Search 12 seconds on either side of each nominal boundary for confirmed RealtimeVAD pauses in the original audio. Use the nominal boundary when there is no suitable pause. Keep a very short final tail with the previous section.
+1. **Plan sections.** Copy the original upload into the job folder. Put section boundaries about five minutes apart on a 25 fps timeline. Search for confirmed RealtimeVAD pauses on either side of each nominal boundary and use the nearest pause midpoint. Use the nominal boundary when there is no suitable pause. Keep a very short final tail with the previous section.
 2. **Transcribe sections.** FFmpeg extracts each section as a frame-aligned video with lossless audio and a 16 kHz mono WAV for STT. 60db transcribes the WAV and returns speaker labels and timestamps. The app saves these results before moving on. It transcribes the whole project through separate section requests. Each section's timestamps are local to that section, and its offset in `sections.json` places them on the full timeline.
 3. **Match speaker identities automatically.** The app uses the 60db labels directly within each section. Across sections, CPU WeSpeaker embeddings compare representative samples and link clear matches. The same label can refer to different people in different requests. Ambiguous matches get separate identities. A single section uses the returned labels directly. **Only one speaker in the entire video** assigns all turns to one identity. The map is saved with the job.
 4. **Create and reuse one clone per person.** The app collects up to ten seconds from the longest detected turns for each mapped person across the sections. It pads the upload with silence to 10.1 seconds when needed for the service's duration check. The job saves the resulting 60db synthesis ID. A preexisting synthesis voice ID can be supplied in single-speaker mode. Clean solo speech helps both matching and cloning. The installed pipeline does not isolate simultaneous speakers and stops when 60db returns overlapping dialogue turns.
 
    When 60db rejects an automatic clone because the voice slots are full, the app
    removes the least recently used eligible Lipsyncstudio clone and retries once.
-   Eligible clones have a local creation record and are private, idle, and absent
-   from unfinished jobs. If none qualify, the job pauses with a quota error.
-5. **Translate and dub a section.** Translate each dialogue turn with 60db chat when a target language is selected. Synthesize each translated turn with its mapped clone and fit it into the original time slot with FFmpeg tempo adjustment. The app saves the continuous dubbed track before starting GPU work. A section with no detected dialogue keeps its original video frames.
+   Eligible clones have a local creation record and are private and idle. The
+   app resolves voices as dialogue is synthesized. It protects the voice
+   currently in use and explicitly selected voice IDs. A paused job can
+   recreate a recycled clone from its saved samples when it resumes. Saved
+   dubbed audio can be rendered even after its clone is recycled. If no voice
+   qualifies, the job pauses with a quota error.
+5. **Translate and dub a section.** Translate each dialogue turn with 60db chat when a target language is selected. Coarse speaker turns longer than 15 seconds are first re-transcribed in shorter intervals guided by RealtimeVAD, keeping their original speaker label and leaving the pauses in place. Synthesize each turn with its mapped clone, trim extra silence from the beginning and end of the generated WAV, and fit the speech into the original time slot with FFmpeg tempo adjustment. The app saves the continuous dubbed track before starting GPU work. A section with no detected dialogue keeps its original video frames.
 6. **Plan render clips.** Run RealtimeVAD on the section's **dubbed** speech. The planner targets 17-second video clips, prefers cuts in confirmed pauses, and uses frame-balanced cuts when no pause fits. The 10–25 second limits include 0.4 seconds of overlap on each available side. A whole section shorter than ten seconds can be one shorter clip.
 7. **Render and assemble.** Run one LatentSync subprocess per render clip. Discard overlap frames and join the exact retained frame counts. If background restoration is enabled, CPU Demucs estimates the original section's ambience and FFmpeg mixes it with the continuous dubbed track. Join completed section video streams and PCM soundtracks in order, encode the final AAC track once, and verify the final video frame count.
 

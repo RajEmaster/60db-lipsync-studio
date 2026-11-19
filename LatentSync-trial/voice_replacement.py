@@ -10,7 +10,7 @@ import uuid
 import numpy as np
 import soundfile as sf
 
-from chunk_video import run, probe
+from chunk_video import RATE, run, probe
 from tts_api import (
     AUTO_LANGUAGE, create_cloned_voice, detect_spoken_language, sdk_client, transcribe, synthesize,
     transcribe_speakers,
@@ -23,6 +23,7 @@ from worker_lifecycle import exclusive_job_resource
 ROOT = Path(__file__).resolve().parent
 CLONE_SPEECH_SECONDS = 10
 CLONE_UPLOAD_SECONDS = 10.1
+MAX_DUB_TURN_SECONDS = 15
 
 
 def assemble_clone_sample(turns, output):
@@ -150,6 +151,21 @@ def tempo_filters(factor):
     return ','.join([*filters, f'atempo={factor:.10f}'])
 
 
+def spoken_sample_bounds(path):
+    """Find TTS edge silence while keeping quiet phonemes and internal pauses."""
+    audio, rate = sf.read(path, dtype='float32', always_2d=True)
+    window = max(1, round(0.01 * rate))
+    remainder = len(audio) % window
+    padded = np.pad(audio, ((0, (window - remainder) % window), (0, 0)))
+    levels = np.sqrt(np.mean(padded.reshape(-1, window, audio.shape[1]) ** 2, axis=(1, 2)))
+    active = np.flatnonzero(levels >= max(0.0003, float(levels.max()) * 0.015))
+    if not len(active):
+        return 0, len(audio), rate, len(audio)
+    margin = round(0.02 * rate)
+    return (max(0, int(active[0]) * window - margin),
+            min(len(audio), (int(active[-1]) + 1) * window + margin), rate, len(audio))
+
+
 def speaker_turns(original, rate, sample_count, language):
     if original.stat().st_size > 100_000_000:
         raise ValueError('The audio exceeds the 60db transcription upload limit. Use a shorter video or a render length limit.')
@@ -170,6 +186,38 @@ def speaker_turns(original, rate, sample_count, language):
         if left[1] > right[0]:
             raise ValueError('60db returned overlapping speaker turns. Use a version with separate, non-overlapping dialogue.')
     return turns
+
+
+def split_long_speaker_turns(original, turns, language):
+    """Re-transcribe coarse diarization turns in bounded speech intervals."""
+    limit = MAX_DUB_TURN_SECONDS * RATE
+    if all(last - first <= limit for first, last, _, _ in turns):
+        return turns
+    speech = [(round(first * RATE), round(last * RATE))
+              for first, last in detect_speech(original)['speech_intervals']]
+    refined = []
+    with TemporaryDirectory() as temp, sf.SoundFile(original) as source:
+        sample = Path(temp) / 'turn.wav'
+        for first, last, speaker, text in turns:
+            if last - first <= limit:
+                refined.append((first, last, speaker, text))
+                continue
+            ranges = [(max(first, start), min(last, end)) for start, end in speech
+                      if start < last and end > first]
+            start_count = len(refined)
+            for start, end in ranges or [(first, last)]:
+                for offset in range(start, end, limit):
+                    stop = min(end, offset + limit)
+                    source.seek(offset)
+                    sf.write(sample, source.read(stop - offset, dtype='int16'), RATE, subtype='PCM_16')
+                    rebuilt = transcribe(sample, language)
+                    if rebuilt:
+                        refined.append((offset, stop, speaker, rebuilt))
+            if len(refined) == start_count:
+                raise RuntimeError(
+                    f'60db could not recover dialogue from the long turn at {first / RATE:.2f}–{last / RATE:.2f}s.'
+                )
+    return refined
 
 
 def replace_voice(video, voice, speed=1.0, duration=0, target_language=ORIGINAL_LANGUAGE,
@@ -201,7 +249,9 @@ def replace_voice(video, voice, speed=1.0, duration=0, target_language=ORIGINAL_
         turns = prepared_turns
     elif multiple_speakers:
         yield None, '', 'Transcribing and identifying speakers with 60db...'
-        turns = speaker_turns(original, rate, len(source), source_language)
+        turns = split_long_speaker_turns(
+            original, speaker_turns(original, rate, len(source), source_language), source_language
+        )
         longest = {}
         for first, last, speaker, _ in turns:
             if speaker not in longest or last - first > longest[speaker][1] - longest[speaker][0]:
@@ -252,16 +302,18 @@ def replace_voice(video, voice, speed=1.0, duration=0, target_language=ORIGINAL_
         if target_language != ORIGINAL_LANGUAGE:
             lines.append(f'{target_language}: {spoken_text}\n')
         yield None, '\n'.join(lines), f'Generating replacement voice for segment {index}/{len(turns)}...'
+        active_voice = (voices(speaker) if callable(voices) else voices[speaker]) if speaker else voice
         started = time.monotonic()
-        generated = synthesize(spoken_text, voices[speaker] if speaker else voice, speed)
+        generated = synthesize(spoken_text, active_voice, speed)
         tts_seconds = time.monotonic() - started
         started = time.monotonic()
-        info = sf.info(generated)
         target_seconds = (last - first) / rate
-        factor = info.duration / target_seconds
+        speech_start, speech_end, generated_rate, total_samples = spoken_sample_bounds(generated)
+        factor = (speech_end - speech_start) / generated_rate / target_seconds
         fitted = folder / f'segment_{index:03d}_replacement.wav'
         run(['ffmpeg', '-hide_banner', '-loglevel', 'error', '-y', '-i', generated,
-             '-af', f'{tempo_filters(factor)},aresample={rate},apad,atrim=end_sample={last-first}',
+             '-af', f'atrim=start_sample={speech_start}:end_sample={speech_end},asetpts=PTS-STARTPTS,'
+                    f'{tempo_filters(factor)},aresample={rate},apad,atrim=end_sample={last-first}',
              '-ar', str(rate), '-ac', '1', str(fitted)])
         audio, _ = sf.read(fitted, dtype='float32')
         if len(audio) != last - first:
@@ -270,9 +322,11 @@ def replace_voice(video, voice, speed=1.0, duration=0, target_language=ORIGINAL_
         fitting_seconds = time.monotonic() - started
         segments.append({'start': start, 'end': end, 'text': text,
                          'target_language': target_language, 'spoken_text': spoken_text,
-                         'generated_audio': generated, 'tempo_factor': factor})
+                         'generated_audio': generated, 'tempo_factor': factor,
+                         'tts_trim_start_seconds': speech_start / generated_rate,
+                         'tts_trim_end_seconds': (total_samples - speech_end) / generated_rate})
         if speaker:
-            segments[-1].update(speaker=speaker, voice_id=voices[speaker])
+            segments[-1].update(speaker=speaker, voice_id=active_voice)
         (folder / 'transcript.json').write_text(json.dumps(segments, indent=2, ensure_ascii=False), encoding='utf-8')
         (folder / 'transcript.txt').write_text('\n'.join(lines), encoding='utf-8')
         if prepared_turns is not None:
