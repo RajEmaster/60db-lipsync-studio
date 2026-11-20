@@ -10,6 +10,7 @@
 # Jupyter Notebook cache files
 .ipynb_checkpoints/
 *.ipynb
+!kaggle/kaggle_lipsyncstudio.ipynb
 
 # Python cache files
 __pycache__/

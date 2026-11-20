@@ -1,10 +1,10 @@
 """Free one slot for a new clone without deleting a user's own voices."""
 from collections import defaultdict
 import json
-import msvcrt
 from pathlib import Path
 import time
 
+from locking_compat import try_lock, unlock
 
 JOBS = Path(__file__).resolve().parent / 'local_jobs'
 RECENT_USE_SECONDS = 120
@@ -15,11 +15,9 @@ def job_is_running(job):
     if not lock.is_file():
         return False
     with lock.open('r+b') as handle:
-        try:
-            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-        except OSError:
+        if not try_lock(handle):
             return True
-        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        unlock(handle)
     return False
 
 
@@ -66,12 +64,18 @@ def recycle_voice_slot(client, workspace):
     for voice in client.get_my_voices()['data']:
         identity = voice.get('voice_id')
         name = voice.get('name') or ''
-        if (identity not in records or not name.startswith('Lipsyncstudio ')
+        # Recycle any app-created clone ("Lipsyncstudio ...") that is not currently
+        # protected. A missing local record (e.g. on ephemeral/cloud storage where
+        # local_jobs is wiped between sessions) means we simply have no recent-use
+        # timestamp, so the clone is treated as old and eligible -- never a user voice.
+        if (not name.startswith('Lipsyncstudio ')
                 or identity in protected or voice.get('voice_provider_id') in protected
                 or voice.get('is_public') or voice.get('status') in ('processing', 'pending', 'training')):
             continue
-        last_used = max(path.stat().st_mtime for path in records[identity])
-        if voice.get('voice_provider_id') in released or time.time() - last_used >= RECENT_USE_SECONDS:
+        paths = records.get(identity, [])
+        last_used = max((path.stat().st_mtime for path in paths), default=0.0)
+        if (voice.get('voice_provider_id') in released or not paths
+                or time.time() - last_used >= RECENT_USE_SECONDS):
             candidates.append((last_used, identity, name))
     if not candidates:
         raise RuntimeError('The voice limit is full and no inactive Lipsyncstudio clone can be recycled.')
@@ -80,6 +84,6 @@ def recycle_voice_slot(client, workspace):
     client.delete_voice(identity)
     if any(voice.get('voice_id') == identity for voice in client.get_my_voices()['data']):
         raise RuntimeError('60db has not confirmed removal of the old clone. No other voices were deleted.')
-    for path in records[identity]:
+    for path in records.get(identity, []):
         path.unlink(missing_ok=True)
     print(f'Freed one 60db slot by removing an inactive app clone ({name}).', flush=True)

@@ -10,8 +10,8 @@ import psutil
 
 @contextmanager
 def exclusive_job_resource(filename, waiting_message):
-    """Serialize access across app processes; Windows releases the lock on exit."""
-    import msvcrt
+    """Serialize access across app processes; the OS releases the lock on exit."""
+    from locking_compat import try_lock, unlock
     folder = Path(__file__).resolve().parent / 'local_jobs'
     folder.mkdir(exist_ok=True)
     with (folder / filename).open('a+b') as handle:
@@ -20,21 +20,15 @@ def exclusive_job_resource(filename, waiting_message):
             handle.write(b'0')
             handle.flush()
         waiting = False
-        while True:
-            handle.seek(0)
-            try:
-                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-                break
-            except OSError:
-                if not waiting:
-                    print(waiting_message, flush=True)
-                    waiting = True
-                time.sleep(1)
+        while not try_lock(handle):
+            if not waiting:
+                print(waiting_message, flush=True)
+                waiting = True
+            time.sleep(1)
         try:
             yield
         finally:
-            handle.seek(0)
-            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            unlock(handle)
 
 
 def exclusive_gpu():

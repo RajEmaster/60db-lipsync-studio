@@ -3,7 +3,6 @@ import argparse
 from contextlib import contextmanager
 import json
 import math
-import msvcrt
 import os
 from pathlib import Path
 import shutil
@@ -23,6 +22,7 @@ from voice_replacement import (
     speaker_turns, split_long_speaker_turns,
 )
 from vad import detect_speech
+from locking_compat import try_lock, unlock
 from worker_lifecycle import watch_parent
 
 ROOT = Path(__file__).resolve().parent
@@ -77,16 +77,12 @@ def job_lock(job):
         if not handle.tell():
             handle.write(b'0')
             handle.flush()
-        handle.seek(0)
-        try:
-            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-        except OSError:
-            raise RuntimeError('This long-video job is already running.') from None
+        if not try_lock(handle):
+            raise RuntimeError('This long-video job is already running.')
         try:
             yield
         finally:
-            handle.seek(0)
-            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            unlock(handle)
 
 
 def start_job(job, video, options):
