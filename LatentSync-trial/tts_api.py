@@ -6,13 +6,13 @@ from pathlib import Path
 import uuid
 import wave
 
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 
 import requests
 import soundfile as sf
 from sixtydb import SixtyDBClient
 from dotenv import load_dotenv
-from voice_slots import recycle_voice_slot
+from voice_slots import recycle_voice_slots
 from worker_lifecycle import exclusive_job_resource
 
 ROOT = Path(__file__).resolve().parent
@@ -62,7 +62,7 @@ class CompatibleSixtyDBClient(SixtyDBClient):
                 data={'name': name, **params}, headers={'Content-Type': None},
             )
         except requests.HTTPError as exc:
-            if exc.response.status_code != 400:
+            if exc.response.status_code != 400 or is_voice_limit(exc):
                 raise
             try:
                 payload = exc.response.json()
@@ -103,7 +103,7 @@ def sdk_client():
 
 
 def is_voice_limit(error):
-    if error.response.status_code != 403:
+    if error.response.status_code not in (400, 403, 409, 429):
         return False
     try:
         body = error.response.json()
@@ -112,7 +112,7 @@ def is_voice_limit(error):
     return isinstance(body, dict) and body.get('code') == 'VOICE_LIMIT_REACHED'
 
 
-def create_cloned_voice(name, sample_path, language, recycle=False):
+def create_cloned_voice(name, sample_path, language):
     name, language = name.strip(), language.strip()
     if not name or not language:
         raise ValueError('Enter a voice name and the source language code.')
@@ -123,8 +123,7 @@ def create_cloned_voice(name, sample_path, language, recycle=False):
     if not path.is_file() or path.suffix.lower() not in content_types:
         raise ValueError(f'Provide an existing WAV, MP3, or FLAC file: {path.name}')
 
-    lock = (exclusive_job_resource('voice_slots.lock', 'Waiting for another clone request…')
-            if recycle else nullcontext())
+    lock = exclusive_job_resource('voice_slots.lock', 'Waiting for another clone request...')
     with lock, path.open('rb') as audio, sdk_client() as client:
         workspace = os.environ.get('SIXTYDB_WORKSPACE_ID', '').strip()
         if not workspace:
@@ -137,9 +136,10 @@ def create_cloned_voice(name, sample_path, language, recycle=False):
         try:
             result = client.create_voice(name, upload, **metadata)
         except requests.HTTPError as exc:
-            if not recycle or not is_voice_limit(exc):
+            if not is_voice_limit(exc):
                 raise
-            recycle_voice_slot(client, workspace)
+            if not recycle_voice_slots(client, workspace, limit=1):
+                raise RuntimeError('The voice limit is full and no inactive Lipsyncstudio clone can be recycled.') from None
             audio.seek(0)
             result = client.create_voice(name, upload, **metadata)
     if isinstance(result, dict):
