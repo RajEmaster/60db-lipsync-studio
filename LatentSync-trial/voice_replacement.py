@@ -121,14 +121,14 @@ def clone_sample(video, name, sample, language, sample_key):
         raise ValueError('No speaker audio is available to clone.')
     minimum = round(CLONE_UPLOAD_SECONDS * rate)
     if len(audio) >= minimum:
-        return create_cloned_voice(name, sample, language, recycle=True)
+        return create_cloned_voice(name, sample, language)
     with TemporaryDirectory() as temp:
         upload = Path(temp) / 'voice_sample.wav'
         padding = [(0, minimum - len(audio))] + [(0, 0)] * (audio.ndim - 1)
         sf.write(upload, np.pad(audio, padding), rate, subtype='PCM_16')
         print(f'Prepared {len(audio) / rate:.2f}s of speaker audio for 60db; '
               f'padded the upload to {CLONE_UPLOAD_SECONDS:g}s.', flush=True)
-        return create_cloned_voice(name, upload, language, recycle=True)
+        return create_cloned_voice(name, upload, language)
 
 
 def reuse_clone_record(record):
