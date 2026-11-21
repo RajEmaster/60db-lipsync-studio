@@ -13,6 +13,7 @@ from speech_cleanup import clean_speech
 from chunk_video import chunk_video, probe, run
 from job_logging import log_event
 from audio_pipeline import speech_timestamps, extract_background, build_soundtrack
+from worker_client import RenderPool, detect_gpu_count
 
 ROOT = Path(__file__).resolve().parent
 
@@ -74,6 +75,78 @@ def join_chunks(manifest_path, rendered, output, soundtrack=None):
     return manifest
 
 
+def resolve_gpus(requested):
+    """Which GPU indices to render across. requested<=0 means every visible GPU."""
+    available = detect_gpu_count()
+    if available <= 0:
+        return [0]   # no CUDA visible from here; the worker will error clearly if truly absent
+    count = min(requested, available) if requested and requested > 0 else available
+    return list(range(max(1, count)))
+
+
+def render_pending_cold(pending, renders, manifest_path, args, total):
+    """Fallback path: one cold subprocess per clip (previous behavior), sequential."""
+    stats_by_index = {}
+    for chunk in pending:
+        index = chunk['index']
+        output = renders / f'chunk_{index:03d}.mp4'
+        log_path = renders / f'chunk_{index:03d}.log'
+        stats_path = Path(str(output) + '.json')
+        log_event(f"Rendering chunk {index}/{total}: {chunk['clip_duration_seconds']:.2f}s "
+                  f"(section timeline {chunk['core_start_seconds']:.2f}–{chunk['core_end_seconds']:.2f}s)")
+        chunk_started = time.monotonic()
+        command = [str(WORKER_PYTHON), '-u', str(ROOT / 'trial_inference.py'),
+                   '--video', (manifest_path.parent / chunk['video']).resolve().relative_to(ROOT).as_posix(),
+                   '--audio', (manifest_path.parent / chunk['audio']).resolve().relative_to(ROOT).as_posix(),
+                   '--output', output.resolve().relative_to(ROOT).as_posix(),
+                   '--frames', str(args.frames), '--steps', str(args.steps), '--cpu-threads', str(args.cpu_threads)]
+        with log_path.open('w', encoding='utf-8') as log:
+            result = subprocess.run(command, cwd=ROOT, stdout=log, stderr=subprocess.STDOUT)
+        if result.returncode or not output.is_file():
+            raise RuntimeError(f"Chunk {index} failed (timeline {chunk['core_start_seconds']:.2f}–{chunk['core_end_seconds']:.2f}s). "
+                               f'Log: {log_path}\n' +
+                               log_path.read_text(encoding='utf-8', errors='replace')[-3500:])
+        stats_by_index[index] = json.loads(stats_path.read_text(encoding='utf-8'))
+        log_event(f'Chunk {index} saved in {time.monotonic() - chunk_started:.1f}s. '
+                  'Worker exited and released its memory.')
+    return stats_by_index
+
+
+def render_pending_pool(pending, renders, manifest_path, args, total):
+    """Render pending clips in parallel across one resident worker per GPU."""
+    gpus = resolve_gpus(args.gpus)
+    gpus = gpus[:max(1, min(len(gpus), len(pending)))]   # no idle workers past clip count
+    index_by_id, clips = {}, []
+    for chunk in pending:
+        index = chunk['index']
+        clip_id = f'{index:03d}'
+        index_by_id[clip_id] = index
+        clips.append({'id': clip_id,
+                      'video': manifest_path.parent / chunk['video'],
+                      'audio': manifest_path.parent / chunk['audio'],
+                      'output': renders / f'chunk_{index:03d}.mp4',
+                      'frames': args.frames, 'steps': args.steps,
+                      'guidance_scale': args.guidance_scale})
+    done = {'n': 0}
+
+    def on_done(clip_id, clip_stats):
+        index = index_by_id[clip_id]
+        save_json(Path(str(renders / f'chunk_{index:03d}.mp4') + '.json'), clip_stats)
+        done['n'] += 1
+        log_event(f"Chunk {index} done ({done['n']}/{len(pending)} this run) in "
+                  f"{clip_stats['seconds']:.1f}s on GPU, peak {clip_stats['peak_cuda_reserved_mib']} MiB.")
+
+    started = time.monotonic()
+    with RenderPool(renders / '.engine_queue', gpus, version=args.version, offload=args.offload,
+                    cpu_threads=args.cpu_threads, parent_pid=args.parent_pid, log_dir=renders) as pool:
+        log_event(f'Render pool ready: {len(pool.ready_workers)} GPU worker(s) for LatentSync '
+                  f'{args.version}. Rendering {len(pending)} clips across {len(gpus)} GPU(s).')
+        results = pool.render_all(clips, on_done=on_done)
+    log_event(f'Rendered {len(pending)} clips in {time.monotonic() - started:.1f}s '
+              f'across {len(gpus)} GPU(s).')
+    return {index_by_id[clip_id]: clip_stats for clip_id, clip_stats in results.items()}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--video', required=True)
@@ -93,6 +166,13 @@ def main():
     parser.add_argument('--overlap', type=float, default=0.4)
     parser.add_argument('--vad-pause-seconds', type=float, default=0.3)
     parser.add_argument('--cpu-threads', type=int, default=4)
+    parser.add_argument('--engine-mode', choices=['resident', 'cold'], default='resident',
+                        help="'resident' loads the model once per section; 'cold' reloads per clip")
+    parser.add_argument('--version', default='1.6', help='LatentSync engine version (1.5 or 1.6)')
+    parser.add_argument('--offload', default='auto', choices=['auto', 'resident', 'swap'])
+    parser.add_argument('--guidance-scale', type=float, default=None)
+    parser.add_argument('--gpus', type=int, default=0,
+                        help='Number of GPUs to render across (0 = all available)')
     args = parser.parse_args()
     if args.parent_pid:
         from worker_lifecycle import watch_parent
@@ -173,41 +253,45 @@ def main():
         log_event(f'Prepared {len(manifest["chunks"])} clips in {time.monotonic() - clips_started:.1f}s.')
     renders = job / 'renders'
     renders.mkdir(exist_ok=True)
-    rendered, stats = [], []
+    total = len(manifest['chunks'])
+
+    # Reuse validated chunks; collect the rest to render (in parallel across GPUs).
+    reused, pending = {}, []
     for chunk in manifest['chunks']:
         index = chunk['index']
         output = renders / f'chunk_{index:03d}.mp4'
-        log_path = renders / f'chunk_{index:03d}.log'
         stats_path = Path(str(output) + '.json')
         if args.resume and stats_path.is_file() and valid_render(output, chunk['keep_to_frame']):
             try:
                 saved = json.loads(stats_path.read_text(encoding='utf-8'))
             except (OSError, ValueError):
                 saved = {}
-            if saved.get('frames_per_batch') == args.frames and saved.get('steps') == args.steps:
-                rendered.append(output)
-                stats.append(saved)
-                log_event(f'Reusing completed chunk {index}/{len(manifest["chunks"])}.')
+            # Old cold renders have no 'version' and were LatentSync 1.5.
+            if (saved.get('frames_per_batch') == args.frames and saved.get('steps') == args.steps
+                    and saved.get('version', '1.5') == args.version):
+                reused[index] = saved
+                log_event(f'Reusing completed chunk {index}/{total}.')
                 continue
         stats_path.unlink(missing_ok=True)
-        log_event(f"Rendering chunk {index}/{len(manifest['chunks'])}: {chunk['clip_duration_seconds']:.2f}s "
-                  f"(section timeline {chunk['core_start_seconds']:.2f}–{chunk['core_end_seconds']:.2f}s)")
-        chunk_started = time.monotonic()
-        command = [str(WORKER_PYTHON), '-u', str(ROOT / 'trial_inference.py'),
-                   '--video', (manifest_path.parent / chunk['video']).resolve().relative_to(ROOT).as_posix(),
-                   '--audio', (manifest_path.parent / chunk['audio']).resolve().relative_to(ROOT).as_posix(),
-                   '--output', output.resolve().relative_to(ROOT).as_posix(),
-                   '--frames', str(args.frames), '--steps', str(args.steps), '--cpu-threads', str(args.cpu_threads)]
-        with log_path.open('w', encoding='utf-8') as log:
-            result = subprocess.run(command, cwd=ROOT, stdout=log, stderr=subprocess.STDOUT)
-        if result.returncode or not output.is_file():
-            raise RuntimeError(f"Chunk {index} failed (timeline {chunk['core_start_seconds']:.2f}–{chunk['core_end_seconds']:.2f}s). "
-                               f'Log: {log_path}\n' +
-                               log_path.read_text(encoding='utf-8', errors='replace')[-3500:])
+        pending.append(chunk)
+
+    fresh = {}
+    if pending:
+        if args.engine_mode == 'cold':
+            fresh = render_pending_cold(pending, renders, manifest_path, args, total)
+        else:
+            fresh = render_pending_pool(pending, renders, manifest_path, args, total)
+
+    rendered, stats = [], []
+    for chunk in manifest['chunks']:
+        index = chunk['index']
+        output = renders / f'chunk_{index:03d}.mp4'
+        clip_stats = reused.get(index) or fresh.get(index)
+        if clip_stats is None or not valid_render(output, chunk['keep_to_frame']):
+            raise RuntimeError(f'Chunk {index} is missing or incomplete after rendering.')
         rendered.append(output)
-        stats.append(json.loads(stats_path.read_text(encoding='utf-8')))
-        log_event(f'Chunk {index} saved in {time.monotonic() - chunk_started:.1f}s. '
-                  'Worker exited and released its memory.')
+        stats.append(clip_stats)
+
     mux_started = time.monotonic()
     log_event('Trimming overlap and joining the video with the continuous speech track.')
     output = job / 'output.mp4'

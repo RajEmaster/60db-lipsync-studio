@@ -171,7 +171,7 @@ def stop_worker(process):
 
 def run_long_video(video, job_id, single_speaker, voice_id, source_language,
                    target_language, speed, duration, steps, frames, restore_background, background_gain,
-                   *render_values):
+                   engine_version, offload, max_gpus, *render_values):
     job_id = (job_id or '').strip().lower()
     if job_id and (len(job_id) != 32 or any(c not in '0123456789abcdef' for c in job_id)):
         raise gr.Error('Enter the 32-character long-video job ID.')
@@ -205,6 +205,9 @@ def run_long_video(video, job_id, single_speaker, voice_id, source_language,
             'target_language': target_language, 'speed': speed,
             'duration': float(duration or 0), 'steps': int(steps), 'batch_frames': int(frames),
             'restore_background': restore_background, 'background_gain': background_gain,
+            'engine_version': (engine_version or '1.5').strip(),
+            'offload': (offload or 'auto').strip(), 'engine_mode': 'resident',
+            'max_gpus': int(max_gpus or 0),
             **render_settings,
         })
         command += ['--video', video, '--options', str(options)]
@@ -338,6 +341,8 @@ def build_ui():
         with gr.Row():
             with gr.Column():
                 video = gr.File(label='Reference video', file_types=['video'], type='filepath')
+                reference_preview = gr.Video(label='Reference video preview', interactive=False,
+                                             show_download_button=False)
                 with gr.Row():
                     source_language = gr.Dropdown(
                         SOURCE_LANGUAGES, value=AUTO_LANGUAGE, allow_custom_value=True,
@@ -397,22 +402,66 @@ def build_ui():
                     cpu_threads = gr.Slider(
                         1, 16, step=1, value=LONG_RENDER_DEFAULTS['cpu_threads'], label='PyTorch CPU threads',
                     )
+                gr.Markdown('### Engine')
+                with gr.Row():
+                    engine_version = gr.Dropdown(
+                        ['1.5', '1.6'], value='1.5', label='LatentSync version',
+                        info='1.6 = sharper 512px but heavy (best on a 16 GB GPU; slow on small cards). '
+                             '1.5 = 256px, fast on small GPUs.',
+                    )
+                    offload = gr.Dropdown(
+                        ['auto', 'resident', 'swap'], value='auto', label='GPU memory mode',
+                        info='auto keeps the model resident on big GPUs and swaps on small ones. '
+                             'The model loads once per section either way.',
+                    )
+                    max_gpus = gr.Number(
+                        value=0, precision=0, minimum=0, maximum=8, label='GPUs to use',
+                        info='0 = every available GPU. Clips render in parallel, one worker per GPU.',
+                    )
 
-        long_job = gr.Textbox(label='Job ID', info='Leave blank for a new job. Resume uses the saved settings.')
-        long_button = gr.Button('Start or resume job', variant='primary')
+        long_job = gr.Textbox(label='Job ID', info='Shown when a job starts. Paste it here to resume or stop that job.')
+        with gr.Row():
+            start_button = gr.Button('Start new job', variant='primary')
+            resume_button = gr.Button('Resume job')
+            stop_button = gr.Button('Stop job', variant='stop')
         with gr.Row():
             long_status = gr.Textbox(label='Job progress', interactive=False, lines=8)
             output = gr.Video(label='Generated video', interactive=False, show_download_button=True)
 
+        # Inputs passed to run_long_video after (video, job_id), in its exact order.
+        render_inputs = [long_single, long_voice, source_language, target_language, speed,
+                         long_duration, steps, frames, restore_background, background_gain,
+                         engine_version, offload, max_gpus,
+                         section_seconds, boundary_search, vad_pause, clip_min, clip_target,
+                         clip_max, overlap, cpu_threads]
+
+        def start_new_job(video, *rest):
+            yield from run_long_video(video, '', *rest)
+
+        def resume_existing_job(video, job_id, *rest):
+            if not (job_id or '').strip():
+                raise gr.Error('Enter the Job ID shown when the job started to resume it.')
+            yield from run_long_video(video, job_id, *rest)
+
         clip_max.input(adjust_clip_controls, inputs=[clip_min, clip_target, clip_max],
                        outputs=[clip_min, clip_target], queue=False, api_name=False)
-        long_button.click(
-            run_long_video, inputs=[video, long_job, long_single, long_voice, source_language,
-                                    target_language, speed, long_duration, steps, frames, restore_background, background_gain,
-                                    section_seconds, boundary_search, vad_pause, clip_min, clip_target, clip_max, overlap,
-                                    cpu_threads],
-            outputs=[long_job, output, long_status], concurrency_id='pipeline', api_name='long_video',
-            show_progress='minimal',
+        # Keep the uploaded reference video visible as a persistent preview.
+        video.change(lambda path: path, inputs=video, outputs=reference_preview,
+                     queue=False, api_name=False)
+        start_event = start_button.click(
+            start_new_job, inputs=[video, *render_inputs],
+            outputs=[long_job, output, long_status], concurrency_id='pipeline',
+            api_name='start_job', show_progress='minimal',
+        )
+        resume_event = resume_button.click(
+            resume_existing_job, inputs=[video, long_job, *render_inputs],
+            outputs=[long_job, output, long_status], concurrency_id='pipeline',
+            api_name='resume_job', show_progress='minimal',
+        )
+        stop_button.click(
+            lambda: 'Stopping the job… its workers are being shut down. Resume with the same Job ID.',
+            inputs=None, outputs=long_status, cancels=[start_event, resume_event],
+            queue=False, api_name='stop_job',
         )
     return demo
 

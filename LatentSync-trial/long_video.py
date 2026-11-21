@@ -344,7 +344,13 @@ def render_section(section, reference, frames, turns, config, mapping, voices):
                '--max-seconds', str(config['clip_max_seconds']),
                '--overlap', str(config['overlap_seconds']),
                '--vad-pause-seconds', str(config['vad_pause_seconds']),
-               '--cpu-threads', str(config['cpu_threads'])]
+               '--cpu-threads', str(config['cpu_threads']),
+               '--engine-mode', str(config.get('engine_mode', 'resident')),
+               '--version', str(config.get('engine_version', '1.5')),
+               '--offload', str(config.get('offload', 'auto')),
+               '--gpus', str(int(config.get('max_gpus', 0)))]
+    if config.get('guidance_scale') is not None:
+        command += ['--guidance-scale', str(config['guidance_scale'])]
     if config['restore_background']:
         command += ['--background-video', str(reference), '--background-gain', str(config['background_gain'])]
     log_event(f'{section.name} render and mix started.')
