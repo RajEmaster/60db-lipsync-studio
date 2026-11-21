@@ -2,6 +2,7 @@
 import argparse
 import json
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import time
@@ -84,6 +85,31 @@ def resolve_gpus(requested):
     return list(range(max(1, count)))
 
 
+def host_worker_cap(n_workers):
+    """Cap parallel workers to what the host's free RAM/disk can feed.
+
+    Each parallel worker is a full pipeline (model + decoded frames + Whisper) and shares
+    one CPU/RAM/disk. Over-subscribing the host is what truncates clips (OOM kill or a
+    starved disk), so when the host is tight we run fewer workers instead of corrupting.
+    """
+    free_ram_gb = free_disk_gb = None
+    try:
+        import psutil
+        free_ram_gb = psutil.virtual_memory().available / 2 ** 30
+    except Exception:
+        pass
+    try:
+        free_disk_gb = shutil.disk_usage(str(ROOT)).free / 2 ** 30
+    except Exception:
+        pass
+    cap = n_workers
+    if free_ram_gb is not None:
+        cap = min(cap, max(1, int(free_ram_gb // 5.0)))   # ~5 GB host RAM per parallel pipeline
+    if free_disk_gb is not None and free_disk_gb < 3.0:   # low disk: don't double write load
+        cap = 1
+    return max(1, cap), free_ram_gb, free_disk_gb
+
+
 def render_pending_cold(pending, renders, manifest_path, args, total):
     """Fallback path: one cold subprocess per clip (previous behavior), sequential."""
     stats_by_index = {}
@@ -117,7 +143,14 @@ def render_pending_pool(pending, renders, manifest_path, args, total):
     detected = detect_gpu_count()
     gpus = resolve_gpus(args.gpus)
     gpus = gpus[:max(1, min(len(gpus), len(pending)))]   # no idle workers past clip count
-    log_event(f'GPU pool: {detected} CUDA device(s) detected; starting {len(gpus)} '
+    cap, free_ram_gb, free_disk_gb = host_worker_cap(len(gpus))
+    headroom = (f'{free_ram_gb:.1f} GB RAM' if free_ram_gb is not None else 'RAM n/a') + \
+               (f', {free_disk_gb:.1f} GB disk free' if free_disk_gb is not None else '')
+    if cap < len(gpus):
+        log_event(f'Host headroom ({headroom}) limits parallelism: using {cap} of {len(gpus)} '
+                  f'GPU worker(s) to avoid truncated clips. Free disk / use a 1.6-only setup for more.')
+        gpus = gpus[:cap]
+    log_event(f'GPU pool: {detected} CUDA device(s) detected, {headroom}; starting {len(gpus)} '
               f'worker(s) on device index(es) {gpus} for {len(pending)} clip(s).')
     index_by_id, clips = {}, []
     for chunk in pending:

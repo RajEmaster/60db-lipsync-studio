@@ -405,9 +405,9 @@ def build_ui():
                 gr.Markdown('### Engine')
                 with gr.Row():
                     engine_version = gr.Dropdown(
-                        ['1.5', '1.6'], value='1.5', label='LatentSync version',
-                        info='1.6 = sharper 512px but heavy (best on a 16 GB GPU; slow on small cards). '
-                             '1.5 = 256px, fast on small GPUs.',
+                        ['1.6', '1.5'], value='1.6', label='LatentSync version',
+                        info='1.6 = sharper 512px (default; best on a 16 GB GPU, slow on small cards). '
+                             'Switch to 1.5 for fast 256px on small GPUs.',
                     )
                     offload = gr.Dropdown(
                         ['auto', 'resident', 'swap'], value='auto', label='GPU memory mode',

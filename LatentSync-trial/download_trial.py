@@ -1,4 +1,10 @@
-"""Download official trial weights directly, with resumable partial files."""
+"""Download official trial weights directly, with resumable partial files.
+
+By default downloads the shared stack (VAE + Whisper) and the LatentSync 1.5 UNet.
+Pass --skip-v15-unet to omit the 5 GB 1.5 UNet (e.g. a 1.6-only Kaggle run, where the
+1.6 UNet is fetched separately into checkpoints/v1.6). Drop the flag to get 1.5 back.
+"""
+import argparse
 from pathlib import Path
 import time
 import requests
@@ -42,7 +48,13 @@ def download(repo, remote, target, revision='main'):
     raise RuntimeError(f'Unable to download {remote}')
 
 if __name__ == '__main__':
-    download('ByteDance/LatentSync-1.5', 'latentsync_unet.pt', 'checkpoints/latentsync_unet.pt')
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--skip-v15-unet', action='store_true',
+                        help='Skip the 5 GB LatentSync 1.5 UNet (1.6-only setups).')
+    args = parser.parse_args()
+    # Shared across 1.5 and 1.6: Whisper audio encoder + the VAE.
     download('ByteDance/LatentSync-1.5', 'whisper/tiny.pt', 'checkpoints/whisper/tiny.pt')
     download('stabilityai/sd-vae-ft-mse', 'config.json', 'checkpoints/vae/config.json')
     download('stabilityai/sd-vae-ft-mse', 'diffusion_pytorch_model.safetensors', 'checkpoints/vae/diffusion_pytorch_model.safetensors')
+    if not args.skip_v15_unet:
+        download('ByteDance/LatentSync-1.5', 'latentsync_unet.pt', 'checkpoints/latentsync_unet.pt')
