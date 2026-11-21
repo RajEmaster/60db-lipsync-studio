@@ -3,6 +3,7 @@ import base64
 import io
 import os
 from pathlib import Path
+import time
 import uuid
 import wave
 
@@ -24,9 +25,36 @@ AUTO_LANGUAGE = 'auto'
 class CompatibleSixtyDBClient(SixtyDBClient):
     """Accept the current audio response while retaining the official SDK interface."""
 
+    RETRY_STATUS = {500, 502, 503, 504}
+
     def _request(self, method, endpoint, **kwargs):
         kwargs.setdefault('timeout', (15, 300))
-        response = super()._request(method, endpoint, **kwargs)
+        files = kwargs.get('files')
+        attempts = 4
+        for attempt in range(1, attempts + 1):
+            # Rewind any upload streams so a retry resends the full file.
+            if files:
+                for value in files.values():
+                    stream = value[1] if isinstance(value, (tuple, list)) else value
+                    if hasattr(stream, 'seek'):
+                        try:
+                            stream.seek(0)
+                        except (OSError, ValueError):
+                            pass
+            try:
+                response = super()._request(method, endpoint, **kwargs)
+                break
+            except requests.HTTPError as exc:
+                status = getattr(getattr(exc, 'response', None), 'status_code', None)
+                if status in self.RETRY_STATUS and attempt < attempts:
+                    time.sleep(min(2 ** (attempt - 1), 8))
+                    continue
+                raise
+            except (requests.ConnectionError, requests.Timeout):
+                if attempt < attempts:
+                    time.sleep(min(2 ** (attempt - 1), 8))
+                    continue
+                raise
         if endpoint == '/tts-synthesize' and isinstance(response, dict):
             if response.get('success') and response.get('audio_base64'):
                 raw = base64.b64decode(response['audio_base64'], validate=True)

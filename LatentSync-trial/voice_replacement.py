@@ -12,8 +12,8 @@ import soundfile as sf
 
 from chunk_video import RATE, run, probe
 from tts_api import (
-    AUTO_LANGUAGE, create_cloned_voice, detect_spoken_language, sdk_client, transcribe, synthesize,
-    transcribe_speakers,
+    AUTO_LANGUAGE, DEFAULT_VOICE, create_cloned_voice, detect_spoken_language, sdk_client,
+    transcribe, synthesize, transcribe_speakers,
 )
 import requests
 from vad import detect_speech
@@ -304,7 +304,16 @@ def replace_voice(video, voice, speed=1.0, duration=0, target_language=ORIGINAL_
         yield None, '\n'.join(lines), f'Generating replacement voice for segment {index}/{len(turns)}...'
         active_voice = (voices(speaker) if callable(voices) else voices[speaker]) if speaker else voice
         started = time.monotonic()
-        generated = synthesize(spoken_text, active_voice, speed)
+        try:
+            generated = synthesize(spoken_text, active_voice, speed)
+        except RuntimeError as exc:
+            # A clone that keeps failing 60db synthesis (even after retries) must not
+            # hard-stop the whole job; fall back to the default voice for this turn.
+            if not active_voice or active_voice == DEFAULT_VOICE:
+                raise
+            print(f'Voice {active_voice} failed 60db synthesis ({exc}); '
+                  f'using the default voice for segment {index}.', flush=True)
+            generated = synthesize(spoken_text, DEFAULT_VOICE, speed)
         tts_seconds = time.monotonic() - started
         started = time.monotonic()
         target_seconds = (last - first) / rate
