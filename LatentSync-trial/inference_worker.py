@@ -62,11 +62,13 @@ def run(args):
     with exclusive_job_resource(args.gpu_lock_name, 'Another render owns this GPU; waiting.'):
         engine = LatentSyncEngine(EngineConfig(
             version=args.version, offload=args.offload, cpu_threads=args.cpu_threads))
+        visible = os.environ.get('CUDA_VISIBLE_DEVICES', '')
         if args.ready_file:
             _write_json_atomic(Path(args.ready_file),
                                {'ready': True, 'version': engine.config.version,
-                                'offload': engine.offload, 'resolution': engine.resolution})
-        print('WORKER_READY', flush=True)
+                                'offload': engine.offload, 'resolution': engine.resolution,
+                                'tag': tag, 'cuda_visible_devices': visible})
+        print(f'WORKER_READY tag={tag} CUDA_VISIBLE_DEVICES={visible!r}', flush=True)
 
         idle_since = time.monotonic()
         while True:

@@ -114,8 +114,11 @@ def render_pending_cold(pending, renders, manifest_path, args, total):
 
 def render_pending_pool(pending, renders, manifest_path, args, total):
     """Render pending clips in parallel across one resident worker per GPU."""
+    detected = detect_gpu_count()
     gpus = resolve_gpus(args.gpus)
     gpus = gpus[:max(1, min(len(gpus), len(pending)))]   # no idle workers past clip count
+    log_event(f'GPU pool: {detected} CUDA device(s) detected; starting {len(gpus)} '
+              f'worker(s) on device index(es) {gpus} for {len(pending)} clip(s).')
     index_by_id, clips = {}, []
     for chunk in pending:
         index = chunk['index']

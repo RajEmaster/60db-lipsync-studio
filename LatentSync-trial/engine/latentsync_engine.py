@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import gc
 import os
+import shutil
 import sys
 import time
 from dataclasses import dataclass
@@ -210,8 +211,14 @@ class LatentSyncEngine:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         if guidance_scale is None:
             guidance_scale = ENGINE_VERSIONS[self.config.version]['guidance_scale']
+        # A temp dir UNIQUE PER CLIP: several workers render in parallel across GPUs and
+        # must not share LatentSync's intermediate files, or they corrupt each other's
+        # frames (0 faces -> ZeroDivisionError). Cleared first so a re-render starts fresh.
         if temp_dir is None:
-            temp_dir = output_path.parent / 'engine_temp'
+            temp_dir = output_path.parent / f'engine_temp_{output_path.stem}'
+        temp_dir = Path(temp_dir)
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        temp_dir.mkdir(parents=True, exist_ok=True)
         self.audio_encoder.num_frames = int(frames)
 
         torch.cuda.reset_peak_memory_stats()
@@ -224,6 +231,7 @@ class LatentSyncEngine:
             mask_image_path=self._mask_image_path, temp_dir=str(temp_dir))
         if not output_path.is_file():
             raise RuntimeError('No output video was produced by the engine.')
+        shutil.rmtree(temp_dir, ignore_errors=True)   # free disk between clips
         return {
             'output': str(output_path),
             'seconds': round(time.monotonic() - started, 2),
