@@ -22,21 +22,24 @@ def main():
     args = parser.parse_args()
     torch.set_num_threads(args.cpu_threads)
     torch.hub.set_dir(str(ROOT / 'models' / 'torch'))
+    # Background separation runs before lip-sync rendering, so the GPU is free here.
+    # Use it when present (much faster, frees the CPU); fall back to CPU otherwise.
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
     data, rate = sf.read(args.input, dtype='float32', always_2d=True)
     if rate != 44100 or data.shape[1] != 2:
         raise ValueError('Worker input must be 44.1 kHz stereo.')
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
-    print('Loading Demucs htdemucs on CPU (first run downloads model weights)...', flush=True)
-    model = get_model('htdemucs').cpu().eval()
+    print(f'Loading Demucs htdemucs on {device.upper()} (first run downloads model weights)...', flush=True)
+    model = get_model('htdemucs').to(device).eval()
     mix = torch.from_numpy(data.T.copy())
     reference = mix.mean(0)
     mean, scale = reference.mean(), reference.std().clamp_min(1e-6)
     print('Separating vocal/speech stem from background in 4-second windows...', flush=True)
     with torch.inference_mode():
-        sources = apply_model(model, ((mix - mean) / scale)[None], device='cpu',
+        sources = apply_model(model, ((mix - mean) / scale)[None], device=device,
                               shifts=0, split=True, overlap=0.25, segment=4,
-                              progress=True, num_workers=0)[0]
+                              progress=True, num_workers=0)[0].cpu()
         voice = (sources[model.sources.index('vocals')] * scale + mean).T.numpy()
     # Residual preserves every sample of the original mix when the stems are summed.
     background = data - voice

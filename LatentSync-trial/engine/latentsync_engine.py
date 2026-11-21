@@ -141,9 +141,12 @@ class LatentSyncEngine:
         vae.enable_tiling()
         self.vae = vae
 
+        # Whisper audio encoding on the GPU frees the CPU and is faster; the model is
+        # tiny (~75 MB) so it costs little VRAM. Its features are already on CUDA for the
+        # pipeline, which avoids a host->device copy per clip.
         self.audio_encoder = Audio2Feature(
             model_path=str(ROOT / 'checkpoints' / 'whisper' / 'tiny.pt'),
-            device='cpu', num_frames=16)
+            device='cuda', num_frames=16)
         self.pipeline = LipsyncPipeline(
             vae=vae, audio_encoder=self.audio_encoder, unet=unet,
             scheduler=DDIMScheduler.from_pretrained(str(ROOT / 'configs')))

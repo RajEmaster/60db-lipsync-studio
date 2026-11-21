@@ -1,5 +1,6 @@
 from insightface.app import FaceAnalysis
 import numpy as np
+import onnxruntime as ort
 import torch
 
 INSIGHTFACE_DETECT_SIZE = 512
@@ -7,10 +8,15 @@ INSIGHTFACE_DETECT_SIZE = 512
 
 class FaceDetector:
     def __init__(self, device="cuda"):
+        # Run detection on the GPU when a CUDA ONNX Runtime is available (big CPU win);
+        # fall back to CPU automatically otherwise so nothing breaks on CPU-only installs.
+        providers = ["CPUExecutionProvider"]
+        if str(device).startswith("cuda") and "CUDAExecutionProvider" in ort.get_available_providers():
+            providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
         self.app = FaceAnalysis(
             allowed_modules=["detection", "landmark_2d_106"],
             root="checkpoints/auxiliary",
-            providers=["CPUExecutionProvider"],
+            providers=providers,
         )
         self.app.prepare(ctx_id=cuda_to_int(device), det_size=(INSIGHTFACE_DETECT_SIZE, INSIGHTFACE_DETECT_SIZE))
 
