@@ -28,6 +28,17 @@ def probe(path):
     return json.loads(run(['ffprobe', '-v', 'error', '-show_streams', '-show_format', '-of', 'json', str(path)]).stdout)
 
 
+def count_frames(path):
+    """Exact video frame count; raises if the file is unreadable (e.g. missing moov atom)."""
+    stream = next(s for s in probe(path)['streams'] if s['codec_type'] == 'video')
+    count = stream.get('nb_frames')
+    if count and count != 'N/A':
+        return int(count)
+    result = run(['ffprobe', '-v', 'error', '-select_streams', 'v:0', '-count_frames',
+                  '-show_entries', 'stream=nb_read_frames', '-of', 'csv=p=0', str(path)])
+    return int(result.stdout.strip())
+
+
 def silence_intervals(audio, threshold=-35, minimum=0.2):
     """Detect quiet intervals, not linguistic sentence boundaries or model VAD."""
     result = run(['ffmpeg', '-hide_banner', '-nostats', '-i', str(audio), '-af',
@@ -152,19 +163,29 @@ def chunk_video(video, audio=None, output_dir=None, minimum=5, maximum=7, target
         start = chunk['clip_start_frame'] / FPS
         frames = chunk['clip_end_frame'] - chunk['clip_start_frame']
         clip_video = output / (name + '.mp4')
+        # Write to a temp name, verify it is complete, then rename. An interrupted or
+        # disk-starved write never leaves a truncated final clip (which would fail later
+        # with "moov atom not found" and be reused forever on resume).
+        clip_partial = output / (name + '.partial.mp4')
         run(['ffmpeg', '-hide_banner', '-loglevel', 'error', '-y', '-ss', str(start),
              '-i', str(normalized), '-an', '-frames:v', str(frames), '-c:v', 'libx264',
-             '-preset', 'fast', '-crf', '18', '-pix_fmt', 'yuv420p', str(clip_video)])
+             '-preset', 'fast', '-crf', '18', '-pix_fmt', 'yuv420p', str(clip_partial)])
+        if count_frames(clip_partial) != frames:
+            raise RuntimeError(f'{name} produced {count_frames(clip_partial)} frames, expected {frames}.')
+        clip_partial.replace(clip_video)
         chunk['video'] = clip_video.name
         chunk['audio'] = None
         if full_audio:
             clip_audio = output / (name + '.wav')
+            clip_audio_partial = output / (name + '.partial.wav')
             first_sample = chunk['clip_start_frame'] * (RATE // FPS)
             last_sample = chunk['clip_end_frame'] * (RATE // FPS)
             run(['ffmpeg', '-hide_banner', '-loglevel', 'error', '-y',
                  '-i', str(full_audio), '-af',
                  f'atrim=start_sample={first_sample}:end_sample={last_sample},asetpts=PTS-STARTPTS',
-                 '-c:a', 'pcm_s16le', str(clip_audio)])
+                 '-c:a', 'pcm_s16le', str(clip_audio_partial)])
+            probe(clip_audio_partial)  # raises if the wav did not finish writing
+            clip_audio_partial.replace(clip_audio)
             chunk['audio'] = clip_audio.name
         print(f"{name}: {chunk['clip_duration_seconds']:.2f}s with context; keep timeline "
               f"{chunk['core_start_seconds']:.2f}-{chunk['core_end_seconds']:.2f}s", flush=True)

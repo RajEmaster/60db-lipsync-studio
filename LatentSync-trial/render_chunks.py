@@ -218,11 +218,22 @@ def main():
     elif background_saved:
         log_event('Reused saved background preparation.')
     plan = job / 'chunk_plan.json'
+    reused_plan = False
     if args.resume and plan.exists():
-        manifest_path = job / json.loads(plan.read_text(encoding='utf-8'))
-        manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
-        log_event('Reused saved render clip plan.')
-    else:
+        try:
+            manifest_path = job / json.loads(plan.read_text(encoding='utf-8'))
+            manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+            # Verify every reused clip input is complete; a truncated clip from an
+            # interrupted earlier run (no moov atom) would otherwise crash rendering.
+            for chunk in manifest['chunks']:
+                expected = chunk['clip_end_frame'] - chunk['clip_start_frame']
+                if not valid_render(manifest_path.parent / chunk['video'], expected, exact=True):
+                    raise RuntimeError(f"clip {chunk['index']} input is unreadable or incomplete")
+            reused_plan = True
+            log_event('Reused saved render clip plan.')
+        except (OSError, ValueError, KeyError, StopIteration, RuntimeError) as exc:
+            log_event(f'Re-chunking: the saved clip plan is unusable ({exc}).')
+    if not reused_plan:
         vad_started = time.monotonic()
         log_event('Finding confirmed speech pauses with RealtimeVAD.')
         timing = speech_timestamps(audio, job, args.vad_pause_seconds)
