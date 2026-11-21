@@ -1,9 +1,12 @@
-# Running Lipsyncstudio on Kaggle (LatentSync 1.5)
+# Running Lipsyncstudio on Kaggle (LatentSync 1.6 / 1.5)
 
 `kaggle_lipsyncstudio.ipynb` runs the full `local_ui.py` dubbing studio on Kaggle's
-free 16 GB GPU and exposes it as a public `*.gradio.live` link. The notebook is
+free GPUs and exposes it as a public `*.gradio.live` link. The notebook is
 self-contained: it clones the public repo and applies all Linux patches in-cell,
-so nothing in the repo needs to change.
+so nothing in the repo needs to change. It downloads **both** LatentSync 1.5 (256px)
+and 1.6 (512px) so you pick either in the UI's **Engine** section. On `GPU T4 ×2` the
+app runs **one resident worker per GPU** and renders a video's clips in parallel across
+both cards (~2× faster) — set **GPUs to use = 0** (all).
 
 ## One-time setup on Kaggle
 
@@ -11,7 +14,7 @@ so nothing in the repo needs to change.
    and upload `kaggle_lipsyncstudio.ipynb` (or **File → Import from GitHub** once this
    file is pushed).
 2. In the right-hand **Settings** panel:
-   - **Accelerator:** `GPU P100` or `GPU T4 x2` (both are 16 GB).
+   - **Accelerator:** `GPU T4 ×2` (2×16 GB, recommended — renders on both cards) or `GPU P100`.
    - **Internet:** `On` (required for clone, pip, and HuggingFace downloads).
 3. **Add-ons → Secrets:** add a secret named **`SIXTYDB_API_KEY`** with your 60db key
    and tick it so it is attached to this notebook.
@@ -28,7 +31,12 @@ so nothing in the repo needs to change.
 | 4 | Repoint `settings.WORKER_PYTHON` (a Windows `.venv` path) at the 3.10 env so the spawned GPU worker and Demucs separator run there |
 | 5 | Write `.env` from the `SIXTYDB_API_KEY` secret |
 | 6 | Download LatentSync **1.5** unet + VAE + Whisper tiny + InsightFace buffalo_l (~5 GB) |
+| 6b | Download LatentSync **1.6** unet (512px) into `checkpoints/v1.6/` (~5 GB) |
 | 7 | Launch Gradio (`run_kaggle.py`) with `share=True` on `0.0.0.0:7860`, under the 3.10 env |
+
+In the UI's **Engine** section: **version** = 1.6 (sharper 512px) or 1.5 (faster 256px);
+**GPU memory mode** = auto; **GPUs to use** = 0 (all). The engine loads the model once per
+section (not per clip), and on T4 ×2 clips fan out across both GPUs.
 
 ### Why a separate Python 3.10 env?
 
@@ -43,8 +51,12 @@ the proven lock avoids this entirely and matches the environment the app was tes
 - **Session lifetime:** the share link lives only while the Kaggle session runs
   (interactive GPU sessions run up to ~9 h; the weekly GPU quota is ~30 h). Re-run to
   get a fresh link. Checkpoints live in `/kaggle/working` for the session only.
-- **16 GB headroom:** the renderer keeps its 4 GB-GPU memory-staging logic (harmless at
-  16 GB). You can safely raise **Inference steps** (e.g. 30–50) and keep **16 frames/batch**.
+- **1.6 vs 1.5:** 1.6 renders at 512px (sharper teeth/lips) and auto-selects `swap` memory
+  mode on a 16 GB T4 — it fits a single T4 but is slower than 1.5's 256px. Keep **16
+  frames/batch**; you can raise **Inference steps** (e.g. 20–30).
+- **Multi-GPU:** on T4 ×2, leave **GPUs to use = 0**. The app starts one resident worker
+  per card (`CUDA_VISIBLE_DEVICES` 0 and 1) draining a shared clip queue; a video's clips
+  render in parallel. One GPU faulting degrades speed instead of failing the job.
 - **Background restore** uses Demucs (cell with `demucs==4.0.1`). If that install fails,
   the app still works — just leave *"Restore original background"* unchecked in the UI.
 - **Security:** a `gradio.live` link is public to anyone who has it and spends your 60db
