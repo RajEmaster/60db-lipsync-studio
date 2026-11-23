@@ -33,6 +33,7 @@ def detect_gpu_count():
 
 class RenderSession:
     def __init__(self, queue_dir, *, version='1.6', offload='auto', cpu_threads=4,
+                 seed=1247, crop_smoothing=0.2,
                  parent_pid=None, log_path=None, startup_timeout=900):
         self.queue = Path(queue_dir)
         self.requests = self.queue / 'requests'
@@ -40,6 +41,8 @@ class RenderSession:
         self.version = version
         self.offload = offload
         self.cpu_threads = cpu_threads
+        self.seed = seed
+        self.crop_smoothing = crop_smoothing
         self.parent_pid = parent_pid
         self.log_path = Path(log_path) if log_path else self.queue / 'worker.log'
         self.startup_timeout = startup_timeout
@@ -58,6 +61,7 @@ class RenderSession:
         command = [str(WORKER_PYTHON), '-u', str(ROOT / 'inference_worker.py'),
                    '--queue', str(self.queue), '--version', str(self.version),
                    '--offload', str(self.offload), '--cpu-threads', str(self.cpu_threads),
+                   '--seed', str(self.seed), '--crop-smoothing', str(self.crop_smoothing),
                    '--ready-file', str(ready_file)]
         if self.parent_pid:
             command += ['--parent-pid', str(self.parent_pid)]
@@ -149,6 +153,7 @@ class RenderPool:
     """
 
     def __init__(self, queue_dir, gpus, *, version='1.6', offload='auto', cpu_threads=4,
+                 seed=1247, crop_smoothing=0.2,
                  parent_pid=None, log_dir=None, startup_timeout=1200):
         self.queue = Path(queue_dir)
         self.requests = self.queue / 'requests'
@@ -159,6 +164,8 @@ class RenderPool:
         self.version = version
         self.offload = offload
         self.cpu_threads = cpu_threads
+        self.seed = seed
+        self.crop_smoothing = crop_smoothing
         self.parent_pid = parent_pid
         self.log_dir = Path(log_dir) if log_dir else self.queue
         self.startup_timeout = startup_timeout
@@ -179,6 +186,7 @@ class RenderPool:
             command = [str(WORKER_PYTHON), '-u', str(ROOT / 'inference_worker.py'),
                        '--queue', str(self.queue), '--version', str(self.version),
                        '--offload', str(self.offload), '--cpu-threads', str(self.cpu_threads),
+                       '--seed', str(self.seed), '--crop-smoothing', str(self.crop_smoothing),
                        '--ready-file', str(ready_file), '--worker-tag', tag,
                        '--gpu-lock-name', f'gpu_{device}.lock']
             if self.parent_pid:

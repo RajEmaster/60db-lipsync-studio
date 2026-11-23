@@ -174,7 +174,8 @@ def render_pending_pool(pending, renders, manifest_path, args, total):
 
     started = time.monotonic()
     with RenderPool(renders / '.engine_queue', gpus, version=args.version, offload=args.offload,
-                    cpu_threads=args.cpu_threads, parent_pid=args.parent_pid, log_dir=renders) as pool:
+                    cpu_threads=args.cpu_threads, seed=args.seed, crop_smoothing=args.crop_smoothing,
+                    parent_pid=args.parent_pid, log_dir=renders) as pool:
         log_event(f'Render pool ready: {len(pool.ready_workers)} GPU worker(s) for LatentSync '
                   f'{args.version}. Rendering {len(pending)} clips across {len(gpus)} GPU(s).')
         results = pool.render_all(clips, on_done=on_done)
@@ -207,6 +208,10 @@ def main():
     parser.add_argument('--version', default='1.6', help='LatentSync engine version (1.5 or 1.6)')
     parser.add_argument('--offload', default='auto', choices=['auto', 'resident', 'swap'])
     parser.add_argument('--guidance-scale', type=float, default=None)
+    parser.add_argument('--seed', type=int, default=1247,
+                        help='Diffusion RNG seed; change to reroll the lip motion.')
+    parser.add_argument('--crop-smoothing', type=float, default=0.2,
+                        help='Mouth-crop smoothing 0.2-0.6; higher = steadier, less flutter.')
     parser.add_argument('--gpus', type=int, default=0,
                         help='Number of GPUs to render across (0 = all available)')
     args = parser.parse_args()
@@ -313,9 +318,14 @@ def main():
                 saved = json.loads(stats_path.read_text(encoding='utf-8'))
             except (OSError, ValueError):
                 saved = {}
-            # Old cold renders have no 'version' and were LatentSync 1.5.
+            # Old cold renders have no 'version' and were LatentSync 1.5. A changed tuning
+            # value (guidance / crop smoothing / seed) must force a re-render, not reuse.
+            guidance_ok = (args.guidance_scale is None
+                           or abs(saved.get('guidance_scale', -1.0) - args.guidance_scale) < 1e-6)
             if (saved.get('frames_per_batch') == args.frames and saved.get('steps') == args.steps
-                    and saved.get('version', '1.5') == args.version):
+                    and saved.get('version', '1.5') == args.version and guidance_ok
+                    and abs(saved.get('crop_smoothing', 0.2) - args.crop_smoothing) < 1e-6
+                    and saved.get('seed', 1247) == args.seed):
                 reused[index] = saved
                 log_event(f'Reusing completed chunk {index}/{total}.')
                 continue

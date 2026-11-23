@@ -61,7 +61,8 @@ def run(args):
     # CUDA_VISIBLE_DEVICES, set by the pool manager).
     with exclusive_job_resource(args.gpu_lock_name, 'Another render owns this GPU; waiting.'):
         engine = LatentSyncEngine(EngineConfig(
-            version=args.version, offload=args.offload, cpu_threads=args.cpu_threads))
+            version=args.version, offload=args.offload, cpu_threads=args.cpu_threads,
+            seed=args.seed, crop_smoothing=args.crop_smoothing))
         visible = os.environ.get('CUDA_VISIBLE_DEVICES', '')
         if args.ready_file:
             _write_json_atomic(Path(args.ready_file),
@@ -118,6 +119,10 @@ def main():
     parser.add_argument('--version', default='1.6', help='LatentSync engine version (1.5 or 1.6)')
     parser.add_argument('--offload', default='auto', choices=['auto', 'resident', 'swap'])
     parser.add_argument('--cpu-threads', type=int, default=4)
+    parser.add_argument('--seed', type=int, default=1247,
+                        help='RNG seed for the diffusion sampler (change to reroll motion).')
+    parser.add_argument('--crop-smoothing', type=float, default=0.2,
+                        help='Mouth-crop position smoothing 0.2-0.6; higher = steadier, less flutter.')
     parser.add_argument('--parent-pid', type=int, help='Owning process; worker stops if it exits')
     parser.add_argument('--idle-seconds', type=float, default=0,
                         help='Exit after this many seconds with no work (0 = never)')

@@ -183,11 +183,16 @@ class AlignRestore(object):
         M = torch.cat((sR, T), dim=1)
 
         if smooth:
+            # Exponential smoothing of the crop's position across frames. A higher history
+            # weight (self.smooth_history) steadies the mouth region against per-frame
+            # landmark jitter (less "floating/flutter"), at the cost of a little lag on fast
+            # head motion. 0.2 is the original LatentSync behavior; the engine can raise it.
+            history = getattr(self, "smooth_history", 0.2)
             bias = points2_normalized[2] - points1_normalized[2]
             if p_bias is None:
                 p_bias = bias
             else:
-                bias = p_bias * 0.2 + bias * 0.8
+                bias = p_bias * history + bias * (1 - history)
             p_bias = bias
             M[:, 2] = M[:, 2] + bias
 

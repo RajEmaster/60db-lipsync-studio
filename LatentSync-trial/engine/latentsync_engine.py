@@ -58,6 +58,7 @@ class EngineConfig:
     offload: str = 'auto'          # 'auto' | 'resident' | 'swap'
     cpu_threads: int = 4
     seed: int = 1247
+    crop_smoothing: float = 0.2    # mouth-crop position EMA history weight (0.2 = LatentSync default)
     checkpoint: str | None = None  # override the version default
     config_path: str | None = None # override the version default
 
@@ -99,10 +100,14 @@ class LatentSyncEngine:
         from latentsync.models.unet import UNet3DConditionModel
         from latentsync.pipelines.lipsync_pipeline import LipsyncPipeline
         from latentsync.whisper.audio2feature import Audio2Feature
+        from latentsync.utils.affine_transform import AlignRestore
 
         self.torch = torch
         torch.set_num_threads(max(1, int(self.config.cpu_threads)))
         torch.manual_seed(self.config.seed)
+        # The face-crop restorer is re-created inside the pipeline per clip, so steer its
+        # temporal smoothing via a class default set once here. Higher = steadier mouth.
+        AlignRestore.smooth_history = float(self.config.crop_smoothing)
         os.chdir(ROOT)  # LatentSync reads mask images / temp dirs relative to the repo root.
 
         if not torch.cuda.is_available():
@@ -243,6 +248,7 @@ class LatentSyncEngine:
             'frames_per_batch': int(frames), 'steps': int(steps),
             'guidance_scale': float(guidance_scale), 'resolution': self.resolution,
             'version': self.config.version, 'offload': self.offload,
+            'crop_smoothing': float(self.config.crop_smoothing), 'seed': int(self.config.seed),
         }
 
     def close(self):

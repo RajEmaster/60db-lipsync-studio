@@ -171,7 +171,7 @@ def stop_worker(process):
 
 def run_long_video(video, job_id, single_speaker, voice_id, source_language,
                    target_language, speed, duration, steps, frames, restore_background, background_gain,
-                   engine_version, offload, max_gpus, *render_values):
+                   engine_version, offload, max_gpus, guidance_scale, crop_smoothing, seed, *render_values):
     job_id = (job_id or '').strip().lower()
     if job_id and (len(job_id) != 32 or any(c not in '0123456789abcdef' for c in job_id)):
         raise gr.Error('Enter the 32-character long-video job ID.')
@@ -208,6 +208,9 @@ def run_long_video(video, job_id, single_speaker, voice_id, source_language,
             'engine_version': (engine_version or '1.5').strip(),
             'offload': (offload or 'auto').strip(), 'engine_mode': 'resident',
             'max_gpus': int(max_gpus or 0),
+            'guidance_scale': float(guidance_scale) if guidance_scale is not None else None,
+            'crop_smoothing': float(crop_smoothing if crop_smoothing is not None else 0.2),
+            'seed': int(seed if seed is not None else 1247),
             **render_settings,
         })
         command += ['--video', video, '--options', str(options)]
@@ -405,9 +408,9 @@ def build_ui():
                 gr.Markdown('### Engine')
                 with gr.Row():
                     engine_version = gr.Dropdown(
-                        ['1.6', '1.5'], value='1.6', label='LatentSync version',
-                        info='1.6 = sharper 512px (default; best on a 16 GB GPU, slow on small cards). '
-                             'Switch to 1.5 for fast 256px on small GPUs.',
+                        ['1.5', '1.6'], value='1.5', label='LatentSync version',
+                        info='1.5 = fast 256px, our focus for natural motion. '
+                             '1.6 = sharper 512px but slow on small cards and no sync gain.',
                     )
                     offload = gr.Dropdown(
                         ['auto', 'resident', 'swap'], value='auto', label='GPU memory mode',
@@ -417,6 +420,22 @@ def build_ui():
                     max_gpus = gr.Number(
                         value=0, precision=0, minimum=0, maximum=8, label='GPUs to use',
                         info='0 = every available GPU. Clips render in parallel, one worker per GPU.',
+                    )
+                gr.Markdown('### Lip-sync tuning')
+                with gr.Row():
+                    guidance_scale = gr.Slider(
+                        1.0, 2.5, value=1.5, step=0.1, label='Audio guidance',
+                        info='How hard the mouth follows the voice. 1.5 = synced yet calm; '
+                             'higher sharpens sync but can look twitchy/over-articulated.',
+                    )
+                    crop_smoothing = gr.Slider(
+                        0.2, 0.6, value=0.4, step=0.05, label='Mouth stability (anti-flutter)',
+                        info='Steadies the mouth region against frame-to-frame jitter. '
+                             '0.2 = original, 0.4-0.5 = smooth/locked for talking-head dubbing.',
+                    )
+                    seed = gr.Number(
+                        value=1247, precision=0, minimum=0, label='Seed',
+                        info='Change to reroll the motion if a clip looks off. Same seed = repeatable.',
                     )
 
         long_job = gr.Textbox(label='Job ID', info='Shown when a job starts. Paste it here to resume or stop that job.')
@@ -431,7 +450,7 @@ def build_ui():
         # Inputs passed to run_long_video after (video, job_id), in its exact order.
         render_inputs = [long_single, long_voice, source_language, target_language, speed,
                          long_duration, steps, frames, restore_background, background_gain,
-                         engine_version, offload, max_gpus,
+                         engine_version, offload, max_gpus, guidance_scale, crop_smoothing, seed,
                          section_seconds, boundary_search, vad_pause, clip_min, clip_target,
                          clip_max, overlap, cpu_threads]
 
