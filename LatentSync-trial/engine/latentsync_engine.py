@@ -39,7 +39,7 @@ ENGINE_VERSIONS = {
     '1.5': {
         'config': 'configs/unet/stage2.yaml',
         'checkpoint': 'checkpoints/latentsync_unet.pt',
-        'guidance_scale': 1.0,
+        'guidance_scale': 1.5,   # matches the official stage2.yaml / gradio default
     },
     '1.6': {
         'config': 'configs/unet/stage2_512.yaml',

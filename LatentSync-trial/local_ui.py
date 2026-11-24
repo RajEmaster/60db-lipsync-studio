@@ -402,7 +402,9 @@ def build_ui():
                     )
                 gr.Markdown('### Compute')
                 with gr.Row():
-                    steps = gr.Slider(2, 50, value=20, step=1, label='Inference steps')
+                    steps = gr.Slider(2, 50, value=20, step=1, label='Inference steps',
+                                      info='Use 20-30 for real quality. Below ~10 the mouth is '
+                                           'blurry/unsynced (those are smoke-test values only).')
                     frames = gr.Dropdown([4, 8, 16], value=16, label='Frames per batch',
                                          info='Choose 4 or 8 to reduce VRAM use.')
                     cpu_threads = gr.Slider(
