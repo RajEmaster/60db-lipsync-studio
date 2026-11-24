@@ -12,6 +12,11 @@ INSIGHTFACE_DETECT_SIZE = 512
 # turned heads are skipped; raise toward 0.45 to be stricter on movie footage.
 FRONTAL_MIN_SYMMETRY = 0.25
 
+# How far (as a multiple of the tracked face's size) a face may move between frames before
+# we treat the lock as lost and re-acquire the largest face (a new shot, or the person left).
+# Keeps selection following ONE person instead of jumping to whoever is biggest each frame.
+MAX_TRACK_JUMP_RATIO = 1.5
+
 
 class FaceDetector:
     def __init__(self, device="cuda"):
@@ -26,37 +31,54 @@ class FaceDetector:
             providers=providers,
         )
         self.app.prepare(ctx_id=cuda_to_int(device), det_size=(INSIGHTFACE_DETECT_SIZE, INSIGHTFACE_DETECT_SIZE))
+        # Temporal face-tracking state so selection sticks to one person across frames.
+        self.prev_center = None
+        self.prev_ref = 0.0
+
+    def reset_track(self):
+        """Forget the tracked face so the next frame re-acquires the largest one."""
+        self.prev_center = None
+        self.prev_ref = 0.0
 
     def __call__(self, frame, threshold=0.5):
         f_h, f_w, _ = frame.shape
 
         faces = self.app.get(frame)
 
-        get_face_store = None
-        max_size = 0
-
         if len(faces) == 0:
+            self.reset_track()   # no face at all -> forget the lock
+            return None, None
+
+        candidates = []
+        for face in faces:
+            bbox = face.bbox.astype(np.int_).tolist()
+            w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
+            if w < 50 or h < 80:
+                continue
+            if w / h > 1.5 or w / h < 0.2:
+                continue
+            if face.det_score < threshold:
+                continue
+            cx, cy = (bbox[0] + bbox[2]) / 2.0, (bbox[1] + bbox[3]) / 2.0
+            candidates.append((face, (cx, cy), w * h, max(w, h)))
+
+        if not candidates:
             return None, None
         else:
-            for face in faces:
-                bbox = face.bbox.astype(np.int_).tolist()
-                w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
-                if w < 50 or h < 80:
-                    continue
-                if w / h > 1.5 or w / h < 0.2:
-                    continue
-                if face.det_score < threshold:
-                    continue
-                size_now = w * h
-
-                if size_now > max_size:
-                    max_size = size_now
-                    get_face_store = face
-
-        if get_face_store is None:
-            return None, None
-        else:
-            face = get_face_store
+            # Temporal face lock: acquire the largest face in the first frame of a shot,
+            # then keep following the one NEAREST to it frame-to-frame (not the largest each
+            # frame), so sync does not jump between people. Re-acquire the largest only when
+            # the tracked face vanishes or leaps too far (new shot / the person left).
+            if self.prev_center is None:
+                chosen = max(candidates, key=lambda c: c[2])
+            else:
+                px, py = self.prev_center
+                chosen = min(candidates, key=lambda c: (c[1][0] - px) ** 2 + (c[1][1] - py) ** 2)
+                jump = ((chosen[1][0] - px) ** 2 + (chosen[1][1] - py) ** 2) ** 0.5
+                if jump > MAX_TRACK_JUMP_RATIO * max(self.prev_ref, 1.0):
+                    chosen = max(candidates, key=lambda c: c[2])
+            self.prev_center, self.prev_ref = chosen[1], chosen[3]
+            face = chosen[0]
             lmk = np.round(face.landmark_2d_106).astype(np.int_)
 
             # Frontality (yaw) gate: compare the horizontal span nose->left-brow vs
