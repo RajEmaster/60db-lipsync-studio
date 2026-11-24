@@ -187,7 +187,8 @@ def prepare_sections(job, config):
                 and not ((section / 'dub_ready.json').is_file() and (section / 'speech/replacement_speech.wav').is_file())):
             log_event(f'{section.name} refining coarse speaker turns at detected speech pauses.')
             started = time.monotonic()
-            refined = split_long_speaker_turns(original, turns, config['source_language'])
+            refined = split_long_speaker_turns(original, turns, config['source_language'],
+                                               minimum_pause=config['vad_pause_seconds'])
             save_json(transcript, refined)
             turns = refined
             log_event(f'{section.name} recovered {len(turns)} bounded turns in {time.monotonic() - started:.1f}s.')

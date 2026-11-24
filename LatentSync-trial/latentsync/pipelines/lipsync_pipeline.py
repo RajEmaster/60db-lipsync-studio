@@ -254,8 +254,16 @@ class LipsyncPipeline(DiffusionPipeline):
         faces = []
         boxes = []
         affine_matrices = []
+        cuts = self.scene_cut_indices(video_frames)
         print(f"Affine transforming {len(video_frames)} faces...")
-        for frame in tqdm.tqdm(video_frames):
+        for index, frame in enumerate(tqdm.tqdm(video_frames)):
+            if index in cuts:
+                # New shot: drop the crop-smoothing history and the face lock so the next
+                # shot re-acquires cleanly instead of dragging the previous shot's crop
+                # position / tracked person across the cut.
+                self.image_processor.restorer.p_bias = None
+                if getattr(self.image_processor, "face_detector", None) is not None:
+                    self.image_processor.face_detector.reset_track()
             try:
                 face, box, affine_matrix = self.image_processor.affine_transform(frame, include_mouth=True)
             except FaceNotDetected:

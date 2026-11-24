@@ -193,13 +193,13 @@ def speaker_turns(original, rate, sample_count, language):
     return turns
 
 
-def split_long_speaker_turns(original, turns, language):
+def split_long_speaker_turns(original, turns, language, minimum_pause=0.3):
     """Re-transcribe coarse diarization turns in bounded speech intervals."""
     limit = MAX_DUB_TURN_SECONDS * RATE
     if all(last - first <= limit for first, last, _, _ in turns):
         return turns
     speech = [(round(first * RATE), round(last * RATE))
-              for first, last in detect_speech(original)['speech_intervals']]
+              for first, last in detect_speech(original, minimum_pause=minimum_pause)['speech_intervals']]
     refined = []
     with TemporaryDirectory() as temp, sf.SoundFile(original) as source:
         sample = Path(temp) / 'turn.wav'

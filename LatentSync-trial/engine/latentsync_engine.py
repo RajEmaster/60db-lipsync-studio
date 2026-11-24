@@ -118,7 +118,13 @@ class LatentSyncEngine:
         props = torch.cuda.get_device_properties(0)
         total_vram_mib = props.total_memory / 2 ** 20
         self.offload = self._choose_offload(total_vram_mib)
-        print(f'Engine GPU: {props.name} ({total_vram_mib:.0f} MiB total). '
+        # Match the official LatentSync precision policy: fp16 only on Ampere+ (compute
+        # capability >= 8). On Turing/Volta (e.g. the Kaggle T4, cc 7.5) the authors use
+        # fp32 for numerical stability, so we follow suit instead of forcing fp16 there.
+        capability = torch.cuda.get_device_capability(0)
+        self.weight_dtype = torch.float16 if capability[0] >= 8 else torch.float32
+        print(f'Engine GPU: {props.name} ({total_vram_mib:.0f} MiB total), '
+              f'compute {capability[0]}.{capability[1]} -> {self.weight_dtype}. '
               f'LatentSync {self.config.version}, offload={self.offload}.', flush=True)
 
         config_path, checkpoint_path = self._resolve_paths()
@@ -132,7 +138,7 @@ class LatentSyncEngine:
         state = checkpoint['state_dict']
         with init_empty_weights():
             unet = UNet3DConditionModel.from_config(OmegaConf.to_container(self._unet_config.model))
-        state = {key: value.to(dtype=torch.float16) if value.is_floating_point() else value
+        state = {key: value.to(dtype=self.weight_dtype) if value.is_floating_point() else value
                  for key, value in state.items()}
         torch.nn.Module.load_state_dict(unet, state, strict=True, assign=True)
         del checkpoint, state
@@ -141,16 +147,15 @@ class LatentSyncEngine:
         self.unet = unet
 
         vae = AutoencoderKL.from_pretrained(str(ROOT / 'checkpoints' / 'vae'),
-                                            torch_dtype=torch.float16, local_files_only=True)
+                                            torch_dtype=self.weight_dtype, local_files_only=True)
         vae.config.scaling_factor = 0.18215
         vae.config.shift_factor = 0
-        vae.enable_slicing()
-        vae.enable_tiling()
+        vae.enable_slicing()   # lossless per-item batch decode; tiling is unused (<=512px) and omitted
         self.vae = vae
 
-        # Whisper audio encoding on the GPU frees the CPU and is faster; the model is
-        # tiny (~75 MB) so it costs little VRAM. Its features are already on CUDA for the
-        # pipeline, which avoids a host->device copy per clip.
+        # Whisper audio encoding runs on the GPU (frees the CPU, and the model is tiny,
+        # ~75 MB). Its features are produced on CPU and moved to CUDA per clip inside the
+        # pipeline's __call__.
         self.audio_encoder = Audio2Feature(
             model_path=str(ROOT / 'checkpoints' / 'whisper' / 'tiny.pt'),
             device='cuda', num_frames=16)
@@ -246,7 +251,7 @@ class LatentSyncEngine:
             video_path=str(video_path), audio_path=str(audio_path),
             video_out_path=str(output_path), num_frames=int(frames),
             num_inference_steps=int(steps), guidance_scale=float(guidance_scale),
-            weight_dtype=torch.float16, width=self.resolution, height=self.resolution,
+            weight_dtype=self.weight_dtype, width=self.resolution, height=self.resolution,
             mask_image_path=self._mask_image_path, temp_dir=str(temp_dir))
         if not output_path.is_file():
             raise RuntimeError('No output video was produced by the engine.')

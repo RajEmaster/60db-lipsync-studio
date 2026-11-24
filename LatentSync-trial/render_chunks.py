@@ -3,12 +3,10 @@ import argparse
 import json
 from pathlib import Path
 import shutil
-import subprocess
 import sys
 import time
 import uuid
 
-from settings import WORKER_PYTHON
 from speech_cleanup import clean_speech
 
 from chunk_video import chunk_video, probe, run
@@ -110,34 +108,6 @@ def host_worker_cap(n_workers):
     return max(1, cap), free_ram_gb, free_disk_gb
 
 
-def render_pending_cold(pending, renders, manifest_path, args, total):
-    """Fallback path: one cold subprocess per clip (previous behavior), sequential."""
-    stats_by_index = {}
-    for chunk in pending:
-        index = chunk['index']
-        output = renders / f'chunk_{index:03d}.mp4'
-        log_path = renders / f'chunk_{index:03d}.log'
-        stats_path = Path(str(output) + '.json')
-        log_event(f"Rendering chunk {index}/{total}: {chunk['clip_duration_seconds']:.2f}s "
-                  f"(section timeline {chunk['core_start_seconds']:.2f}–{chunk['core_end_seconds']:.2f}s)")
-        chunk_started = time.monotonic()
-        command = [str(WORKER_PYTHON), '-u', str(ROOT / 'trial_inference.py'),
-                   '--video', (manifest_path.parent / chunk['video']).resolve().relative_to(ROOT).as_posix(),
-                   '--audio', (manifest_path.parent / chunk['audio']).resolve().relative_to(ROOT).as_posix(),
-                   '--output', output.resolve().relative_to(ROOT).as_posix(),
-                   '--frames', str(args.frames), '--steps', str(args.steps), '--cpu-threads', str(args.cpu_threads)]
-        with log_path.open('w', encoding='utf-8') as log:
-            result = subprocess.run(command, cwd=ROOT, stdout=log, stderr=subprocess.STDOUT)
-        if result.returncode or not output.is_file():
-            raise RuntimeError(f"Chunk {index} failed (timeline {chunk['core_start_seconds']:.2f}–{chunk['core_end_seconds']:.2f}s). "
-                               f'Log: {log_path}\n' +
-                               log_path.read_text(encoding='utf-8', errors='replace')[-3500:])
-        stats_by_index[index] = json.loads(stats_path.read_text(encoding='utf-8'))
-        log_event(f'Chunk {index} saved in {time.monotonic() - chunk_started:.1f}s. '
-                  'Worker exited and released its memory.')
-    return stats_by_index
-
-
 def render_pending_pool(pending, renders, manifest_path, args, total):
     """Render pending clips in parallel across one resident worker per GPU."""
     detected = detect_gpu_count()
@@ -204,8 +174,9 @@ def main():
     parser.add_argument('--overlap', type=float, default=0.4)
     parser.add_argument('--vad-pause-seconds', type=float, default=0.3)
     parser.add_argument('--cpu-threads', type=int, default=4)
-    parser.add_argument('--engine-mode', choices=['resident', 'cold'], default='resident',
-                        help="'resident' loads the model once per section; 'cold' reloads per clip")
+    parser.add_argument('--engine-mode', choices=['resident'], default='resident',
+                        help="Resident worker pool: the model loads once per section. (The old "
+                             "per-clip 'cold' path was removed because it ignored tuning settings.)")
     parser.add_argument('--version', default='1.6', help='LatentSync engine version (1.5 or 1.6)')
     parser.add_argument('--offload', default='auto', choices=['auto', 'resident', 'swap'])
     parser.add_argument('--guidance-scale', type=float, default=None)
@@ -342,10 +313,7 @@ def main():
 
     fresh = {}
     if pending:
-        if args.engine_mode == 'cold':
-            fresh = render_pending_cold(pending, renders, manifest_path, args, total)
-        else:
-            fresh = render_pending_pool(pending, renders, manifest_path, args, total)
+        fresh = render_pending_pool(pending, renders, manifest_path, args, total)
 
     rendered, stats = [], []
     for chunk in manifest['chunks']:
