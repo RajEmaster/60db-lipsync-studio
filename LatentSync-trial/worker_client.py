@@ -33,7 +33,7 @@ def detect_gpu_count():
 
 class RenderSession:
     def __init__(self, queue_dir, *, version='1.6', offload='auto', cpu_threads=4,
-                 seed=1247, crop_smoothing=0.2,
+                 seed=1247, crop_smoothing=0.2, face_restore=False, restore_strength=0.5,
                  parent_pid=None, log_path=None, startup_timeout=900):
         self.queue = Path(queue_dir)
         self.requests = self.queue / 'requests'
@@ -43,6 +43,8 @@ class RenderSession:
         self.cpu_threads = cpu_threads
         self.seed = seed
         self.crop_smoothing = crop_smoothing
+        self.face_restore = face_restore
+        self.restore_strength = restore_strength
         self.parent_pid = parent_pid
         self.log_path = Path(log_path) if log_path else self.queue / 'worker.log'
         self.startup_timeout = startup_timeout
@@ -62,7 +64,10 @@ class RenderSession:
                    '--queue', str(self.queue), '--version', str(self.version),
                    '--offload', str(self.offload), '--cpu-threads', str(self.cpu_threads),
                    '--seed', str(self.seed), '--crop-smoothing', str(self.crop_smoothing),
+                   '--restore-strength', str(self.restore_strength),
                    '--ready-file', str(ready_file)]
+        if self.face_restore:
+            command.append('--face-restore')
         if self.parent_pid:
             command += ['--parent-pid', str(self.parent_pid)]
         self._log = self.log_path.open('w', encoding='utf-8')
@@ -153,7 +158,7 @@ class RenderPool:
     """
 
     def __init__(self, queue_dir, gpus, *, version='1.6', offload='auto', cpu_threads=4,
-                 seed=1247, crop_smoothing=0.2,
+                 seed=1247, crop_smoothing=0.2, face_restore=False, restore_strength=0.5,
                  parent_pid=None, log_dir=None, startup_timeout=1200):
         self.queue = Path(queue_dir)
         self.requests = self.queue / 'requests'
@@ -166,6 +171,8 @@ class RenderPool:
         self.cpu_threads = cpu_threads
         self.seed = seed
         self.crop_smoothing = crop_smoothing
+        self.face_restore = face_restore
+        self.restore_strength = restore_strength
         self.parent_pid = parent_pid
         self.log_dir = Path(log_dir) if log_dir else self.queue
         self.startup_timeout = startup_timeout
@@ -187,8 +194,11 @@ class RenderPool:
                        '--queue', str(self.queue), '--version', str(self.version),
                        '--offload', str(self.offload), '--cpu-threads', str(self.cpu_threads),
                        '--seed', str(self.seed), '--crop-smoothing', str(self.crop_smoothing),
+                       '--restore-strength', str(self.restore_strength),
                        '--ready-file', str(ready_file), '--worker-tag', tag,
                        '--gpu-lock-name', f'gpu_{device}.lock']
+            if self.face_restore:
+                command.append('--face-restore')
             if self.parent_pid:
                 command += ['--parent-pid', str(self.parent_pid)]
             env = {**os.environ, 'PYTHONIOENCODING': 'utf-8',

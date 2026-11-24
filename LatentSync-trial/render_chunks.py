@@ -175,6 +175,7 @@ def render_pending_pool(pending, renders, manifest_path, args, total):
     started = time.monotonic()
     with RenderPool(renders / '.engine_queue', gpus, version=args.version, offload=args.offload,
                     cpu_threads=args.cpu_threads, seed=args.seed, crop_smoothing=args.crop_smoothing,
+                    face_restore=args.face_restore, restore_strength=args.restore_strength,
                     parent_pid=args.parent_pid, log_dir=renders) as pool:
         log_event(f'Render pool ready: {len(pool.ready_workers)} GPU worker(s) for LatentSync '
                   f'{args.version}. Rendering {len(pending)} clips across {len(gpus)} GPU(s).')
@@ -212,6 +213,10 @@ def main():
                         help='Diffusion RNG seed; change to reroll the lip motion.')
     parser.add_argument('--crop-smoothing', type=float, default=0.2,
                         help='Mouth-crop smoothing 0.2-0.6; higher = steadier, less flutter.')
+    parser.add_argument('--face-restore', action='store_true',
+                        help='GFPGAN (ONNX) polish on the generated face (needs the restore model).')
+    parser.add_argument('--restore-strength', type=float, default=0.5,
+                        help='0..1 blend of restored vs original face (lower = subtler, less flicker).')
     parser.add_argument('--gpus', type=int, default=0,
                         help='Number of GPUs to render across (0 = all available)')
     args = parser.parse_args()
@@ -322,10 +327,13 @@ def main():
             # value (guidance / crop smoothing / seed) must force a re-render, not reuse.
             guidance_ok = (args.guidance_scale is None
                            or abs(saved.get('guidance_scale', -1.0) - args.guidance_scale) < 1e-6)
+            restore_ok = (saved.get('face_restore', False) == args.face_restore
+                          and (not args.face_restore
+                               or abs(saved.get('restore_strength', 0.5) - args.restore_strength) < 1e-6))
             if (saved.get('frames_per_batch') == args.frames and saved.get('steps') == args.steps
                     and saved.get('version', '1.5') == args.version and guidance_ok
                     and abs(saved.get('crop_smoothing', 0.2) - args.crop_smoothing) < 1e-6
-                    and saved.get('seed', 1247) == args.seed):
+                    and saved.get('seed', 1247) == args.seed and restore_ok):
                 reused[index] = saved
                 log_event(f'Reusing completed chunk {index}/{total}.')
                 continue

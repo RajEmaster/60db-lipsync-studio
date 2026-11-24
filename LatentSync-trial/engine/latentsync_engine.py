@@ -59,6 +59,8 @@ class EngineConfig:
     cpu_threads: int = 4
     seed: int = 1247
     crop_smoothing: float = 0.2    # mouth-crop position EMA history weight (0.2 = LatentSync default)
+    face_restore: bool = False     # GFPGAN (ONNX) polish on the generated face
+    restore_strength: float = 0.5  # 0..1 blend of restored vs original (lower = subtler, less flicker)
     checkpoint: str | None = None  # override the version default
     config_path: str | None = None # override the version default
 
@@ -160,6 +162,15 @@ class LatentSyncEngine:
         self.pipeline.__class__._execution_device = property(lambda _self: torch.device('cuda'))
         self._install_memory_policy()
 
+        # Optional GFPGAN (ONNX) face restoration. Loaded once; a missing model or any
+        # failure degrades to a no-op inside FaceRestorer, so it never breaks a render.
+        self.pipeline.face_restorer = None
+        if self.config.face_restore:
+            from latentsync.utils.face_restore import FaceRestorer
+            self.pipeline.face_restorer = FaceRestorer(
+                ROOT / 'checkpoints' / 'restore' / 'gfpgan.onnx',
+                device='cuda', strength=self.config.restore_strength)
+
         if self.offload == 'resident':
             unet.to('cuda')
             vae.to('cuda')
@@ -249,6 +260,8 @@ class LatentSyncEngine:
             'guidance_scale': float(guidance_scale), 'resolution': self.resolution,
             'version': self.config.version, 'offload': self.offload,
             'crop_smoothing': float(self.config.crop_smoothing), 'seed': int(self.config.seed),
+            'face_restore': bool(self.config.face_restore),
+            'restore_strength': float(self.config.restore_strength),
         }
 
     def close(self):

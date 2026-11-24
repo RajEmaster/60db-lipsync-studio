@@ -62,7 +62,8 @@ def run(args):
     with exclusive_job_resource(args.gpu_lock_name, 'Another render owns this GPU; waiting.'):
         engine = LatentSyncEngine(EngineConfig(
             version=args.version, offload=args.offload, cpu_threads=args.cpu_threads,
-            seed=args.seed, crop_smoothing=args.crop_smoothing))
+            seed=args.seed, crop_smoothing=args.crop_smoothing,
+            face_restore=args.face_restore, restore_strength=args.restore_strength))
         visible = os.environ.get('CUDA_VISIBLE_DEVICES', '')
         if args.ready_file:
             _write_json_atomic(Path(args.ready_file),
@@ -123,6 +124,10 @@ def main():
                         help='RNG seed for the diffusion sampler (change to reroll motion).')
     parser.add_argument('--crop-smoothing', type=float, default=0.2,
                         help='Mouth-crop position smoothing 0.2-0.6; higher = steadier, less flutter.')
+    parser.add_argument('--face-restore', action='store_true',
+                        help='Enable GFPGAN (ONNX) polish on the generated face.')
+    parser.add_argument('--restore-strength', type=float, default=0.5,
+                        help='0..1 blend of restored vs original face (lower = subtler).')
     parser.add_argument('--parent-pid', type=int, help='Owning process; worker stops if it exits')
     parser.add_argument('--idle-seconds', type=float, default=0,
                         help='Exit after this many seconds with no work (0 = never)')

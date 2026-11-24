@@ -492,6 +492,11 @@ class LipsyncPipeline(DiffusionPipeline):
             decoded_latents = self.paste_surrounding_pixels_back(
                 decoded_latents, ref_pixel_values, 1 - masks, device, weight_dtype
             )
+            # Optional GFPGAN polish on the generated face (only the mouth region is pasted
+            # back, so this sharpens exactly what the UNet produced). No-op unless enabled.
+            restorer = getattr(self, "face_restorer", None)
+            if restorer is not None and restorer.ok:
+                decoded_latents = restorer.enhance_batch(decoded_latents)
             synced_video_frames[first:last] = self.restore_video(
                 decoded_latents, video_frames[first:last], boxes[first:last], affine_matrices[first:last]
             )

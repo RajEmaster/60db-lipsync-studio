@@ -51,6 +51,8 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--skip-v15-unet', action='store_true',
                         help='Skip the 5 GB LatentSync 1.5 UNet (1.6-only setups).')
+    parser.add_argument('--restore', action='store_true',
+                        help='Also fetch the GFPGAN face-restoration ONNX model (~340 MB).')
     args = parser.parse_args()
     # Shared across 1.5 and 1.6: Whisper audio encoder + the VAE.
     download('ByteDance/LatentSync-1.5', 'whisper/tiny.pt', 'checkpoints/whisper/tiny.pt')
@@ -58,3 +60,6 @@ if __name__ == '__main__':
     download('stabilityai/sd-vae-ft-mse', 'diffusion_pytorch_model.safetensors', 'checkpoints/vae/diffusion_pytorch_model.safetensors')
     if not args.skip_v15_unet:
         download('ByteDance/LatentSync-1.5', 'latentsync_unet.pt', 'checkpoints/latentsync_unet.pt')
+    # Optional GFPGAN (ONNX) face-restoration model for the "Polish" post-pass.
+    if args.restore:
+        download('netrunner-exe/Face-Upscalers-onnx', 'GFPGANv1.4.onnx', 'checkpoints/restore/gfpgan.onnx')

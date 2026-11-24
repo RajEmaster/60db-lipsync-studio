@@ -171,7 +171,8 @@ def stop_worker(process):
 
 def run_long_video(video, job_id, single_speaker, voice_id, source_language,
                    target_language, speed, duration, steps, frames, restore_background, background_gain,
-                   engine_version, offload, max_gpus, guidance_scale, crop_smoothing, seed, *render_values):
+                   engine_version, offload, max_gpus, guidance_scale, crop_smoothing, seed,
+                   face_restore, restore_strength, *render_values):
     job_id = (job_id or '').strip().lower()
     if job_id and (len(job_id) != 32 or any(c not in '0123456789abcdef' for c in job_id)):
         raise gr.Error('Enter the 32-character long-video job ID.')
@@ -211,6 +212,8 @@ def run_long_video(video, job_id, single_speaker, voice_id, source_language,
             'guidance_scale': float(guidance_scale) if guidance_scale is not None else None,
             'crop_smoothing': float(crop_smoothing if crop_smoothing is not None else 0.2),
             'seed': int(seed if seed is not None else 1247),
+            'face_restore': bool(face_restore),
+            'restore_strength': float(restore_strength if restore_strength is not None else 0.5),
             **render_settings,
         })
         command += ['--video', video, '--options', str(options)]
@@ -437,6 +440,17 @@ def build_ui():
                         value=1247, precision=0, minimum=0, label='Seed',
                         info='Change to reroll the motion if a clip looks off. Same seed = repeatable.',
                     )
+                gr.Markdown('### Polish (optional)')
+                with gr.Row():
+                    face_restore = gr.Checkbox(
+                        value=False, label='Face restoration (GFPGAN)',
+                        info='Sharpen the generated mouth with GFPGAN. Needs the restore model '
+                             '(download_trial.py --restore); off = no change. Adds GPU time.',
+                    )
+                    restore_strength = gr.Slider(
+                        0.0, 1.0, value=0.5, step=0.05, label='Restoration strength',
+                        info='Blend of restored vs original. Lower = subtler, less flicker/identity drift.',
+                    )
 
         long_job = gr.Textbox(label='Job ID', info='Shown when a job starts. Paste it here to resume or stop that job.')
         with gr.Row():
@@ -451,6 +465,7 @@ def build_ui():
         render_inputs = [long_single, long_voice, source_language, target_language, speed,
                          long_duration, steps, frames, restore_background, background_gain,
                          engine_version, offload, max_gpus, guidance_scale, crop_smoothing, seed,
+                         face_restore, restore_strength,
                          section_seconds, boundary_search, vad_pause, clip_min, clip_target,
                          clip_max, overlap, cpu_threads]
 

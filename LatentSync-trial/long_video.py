@@ -352,7 +352,10 @@ def render_section(section, reference, frames, turns, config, mapping, voices):
     if config.get('guidance_scale') is not None:
         command += ['--guidance-scale', str(config['guidance_scale'])]
     command += ['--seed', str(int(config.get('seed', 1247))),
-                '--crop-smoothing', str(float(config.get('crop_smoothing', 0.2)))]
+                '--crop-smoothing', str(float(config.get('crop_smoothing', 0.2))),
+                '--restore-strength', str(float(config.get('restore_strength', 0.5)))]
+    if config.get('face_restore'):
+        command.append('--face-restore')
     if config['restore_background']:
         command += ['--background-video', str(reference), '--background-gain', str(config['background_gain'])]
     log_event(f'{section.name} render and mix started.')
