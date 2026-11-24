@@ -25,6 +25,11 @@ CLONE_SPEECH_SECONDS = 10
 CLONE_UPLOAD_SECONDS = 10.1
 MAX_DUB_TURN_SECONDS = 15
 
+# Don't slow a dub below this tempo to fill its slot; pad natural silence instead of
+# stretching speech into a sluggish, distorted drawl. The fast side is left uncapped so a
+# longer translation is never truncated — length-aware translation keeps the factor near 1.
+MIN_TEMPO = 0.85
+
 
 def assemble_clone_sample(turns, output):
     """Collect up to ten seconds of speech from one speaker's longest turns."""
@@ -297,7 +302,7 @@ def replace_voice(video, voice, speed=1.0, duration=0, target_language=ORIGINAL_
         if target_language != ORIGINAL_LANGUAGE:
             yield None, '\n'.join(lines), f'Translating segment {index}/{len(turns)} into {target_language} with 60db...'
         started = time.monotonic()
-        spoken_text = translate(text, target_language)
+        spoken_text = translate(text, target_language, target_seconds=(last - first) / rate)
         translation_seconds = time.monotonic() - started
         if target_language != ORIGINAL_LANGUAGE:
             lines.append(f'{target_language}: {spoken_text}\n')
@@ -319,6 +324,9 @@ def replace_voice(video, voice, speed=1.0, duration=0, target_language=ORIGINAL_
         target_seconds = (last - first) / rate
         speech_start, speech_end, generated_rate, total_samples = spoken_sample_bounds(generated)
         factor = (speech_end - speech_start) / generated_rate / target_seconds
+        # Clamp the slow side so a short dub isn't stretched into an unnatural drawl; the
+        # leftover slot becomes natural silence. Fast side uncapped -> no words truncated.
+        factor = max(factor, MIN_TEMPO)
         fitted = folder / f'segment_{index:03d}_replacement.wav'
         run(['ffmpeg', '-hide_banner', '-loglevel', 'error', '-y', '-i', generated,
              '-af', f'atrim=start_sample={speech_start}:end_sample={speech_end},asetpts=PTS-STARTPTS,'
