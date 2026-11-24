@@ -5,6 +5,13 @@ import torch
 
 INSIGHTFACE_DETECT_SIZE = 512
 
+# Lip-sync looks wrong on strongly non-frontal faces (the mouth gets pasted onto a
+# profile where it doesn't belong). When the detected face is too turned, we skip it so
+# the frame passes through UNCHANGED (original mouth kept) instead of showing a bad sync.
+# 1.0 == dead frontal; a near-profile approaches 0. Conservative by default so only clearly
+# turned heads are skipped; raise toward 0.45 to be stricter on movie footage.
+FRONTAL_MIN_SYMMETRY = 0.25
+
 
 class FaceDetector:
     def __init__(self, device="cuda"):
@@ -51,6 +58,18 @@ class FaceDetector:
         else:
             face = get_face_store
             lmk = np.round(face.landmark_2d_106).astype(np.int_)
+
+            # Frontality (yaw) gate: compare the horizontal span nose->left-brow vs
+            # nose->right-brow. On a profile, one span collapses toward zero. Faces below
+            # the symmetry floor are rejected -> the pipeline keeps the original frame.
+            left_brow = lmk[[43, 48, 49, 51, 50]].mean(axis=0)
+            right_brow = lmk[101:106].mean(axis=0)
+            nose_center = lmk[[74, 77, 83, 86]].mean(axis=0)
+            dl = abs(nose_center[0] - left_brow[0])
+            dr = abs(right_brow[0] - nose_center[0])
+            symmetry = min(dl, dr) / max(dl, dr) if max(dl, dr) > 1e-3 else 0.0
+            if symmetry < FRONTAL_MIN_SYMMETRY:
+                return None, None
 
             halk_face_coord = np.mean([lmk[74], lmk[73]], axis=0)  # lmk[73]
 

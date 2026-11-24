@@ -316,14 +316,36 @@ class LipsyncPipeline(DiffusionPipeline):
         return video_frames, faces, boxes, affine_matrices
 
     @staticmethod
-    def face_batches(boxes, num_frames):
-        """Group consecutive detected frames without crossing gaps in detection."""
+    def scene_cut_indices(video_frames, threshold=0.20):
+        """Frame indices where a hard shot cut begins (a large whole-frame change).
+        A temporal window must not span two different shots or the model blends them into
+        mush. `threshold` is a normalized mean-abs frame difference on a downscaled frame;
+        raise it to detect fewer cuts, lower it to catch softer ones."""
+        if len(video_frames) < 2:
+            return frozenset()
+        small = video_frames[:, ::16, ::16, :].astype(np.float32).mean(axis=3)
+        diffs = np.abs(small[1:] - small[:-1]).mean(axis=(1, 2)) / 255.0
+        return frozenset(int(i) + 1 for i, d in enumerate(diffs) if d > threshold)
+
+    @staticmethod
+    def face_batches(boxes, num_frames, cuts=frozenset(), min_run=1):
+        """Group consecutive detected frames into temporal windows that never cross a
+        detection gap OR a scene cut. A detected run shorter than `min_run` frames is
+        skipped entirely, so those frames keep their original mouth — a brief or rapidly
+        cutting shot can't be lip-synced well, so we leave it untouched."""
         batches = []
         for detected, entries in groupby(enumerate(boxes), key=lambda entry: entry[1] is not None):
-            if detected:
-                indices = [index for index, _ in entries]
-                batches.extend((start, min(start + num_frames, indices[-1] + 1))
-                               for start in range(indices[0], indices[-1] + 1, num_frames))
+            if not detected:
+                continue
+            indices = [index for index, _ in entries]
+            seg_start = indices[0]
+            # Close a segment at each scene cut inside the run, and at the run's end.
+            for idx in range(indices[0] + 1, indices[-1] + 2):
+                if idx in cuts or idx == indices[-1] + 1:
+                    if idx - seg_start >= min_run:
+                        batches.extend((start, min(start + num_frames, idx))
+                                       for start in range(seg_start, idx, num_frames))
+                    seg_start = idx
         return batches
 
     @torch.no_grad()
@@ -390,7 +412,10 @@ class LipsyncPipeline(DiffusionPipeline):
         missing_frames = sum(box is None for box in boxes)
         if missing_frames:
             print(f"Keeping {missing_frames}/{len(boxes)} original frames with no eligible face.", flush=True)
-        batches = self.face_batches(boxes, num_frames)
+        cuts = self.scene_cut_indices(video_frames)
+        if cuts:
+            print(f"Detected {len(cuts)} scene cut(s); temporal windows will not cross them.", flush=True)
+        batches = self.face_batches(boxes, num_frames, cuts=cuts, min_run=4)
         if batches:
             all_latents = self.prepare_latents(
                 len(whisper_chunks), self.vae.config.latent_channels, height, width,
