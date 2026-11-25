@@ -16,6 +16,11 @@ MODEL_REVISION = 'f0c48c298fd835726c27956a5d617bad7115627e'
 MODEL_SHA256 = '7bb2f06e9df17cdf1ef14ee8a15ab08ed28e8d0ef5054ee135741560df2ec068'
 MATCH_SCORE = 0.65
 MATCH_MARGIN = 0.08
+# Within a section, only move a turn to a different speaker when its voice clearly matches
+# that speaker better than its diarized one — conservative, so we fix obvious mislabels
+# without disturbing uncertain turns (which could make diarization worse).
+REFINE_SCORE = 0.50     # the other speaker must look like a real match
+REFINE_MARGIN = 0.10    # and beat the diarized speaker by this cosine margin
 
 
 class SpeakerEncoder:
@@ -37,6 +42,9 @@ class SpeakerEncoder:
 
     def embed(self, sample):
         audio, rate = sf.read(sample, dtype='int16')
+        return self.embed_audio(audio, rate)
+
+    def embed_audio(self, audio, rate):
         if rate != 16000 or audio.ndim != 1:
             raise ValueError('Speaker samples must be 16 kHz mono.')
         if len(audio) < rate * 0.8:
@@ -95,3 +103,64 @@ def match_speakers(job, observations):
                 profile = profiles.get(speaker, embedding) + embedding
                 profiles[speaker] = profile / np.linalg.norm(profile)
     return mapping
+
+
+def refine_turns_by_voice(original, turns, rate=16000):
+    """Correct 60db's per-turn speaker labels using voice embeddings.
+
+    60db diarization usually gets the speaker COUNT and rough grouping right but mislabels
+    individual segments, which shows up as both wrong turn boundaries (a false speaker change)
+    and the wrong cloned voice on that turn. Here we build a voice profile per diarized
+    speaker (the mean embedding of their turns) and move a turn to another speaker only when
+    its voice clearly matches that speaker better. `turns` is a list of (first, last, speaker,
+    text) in samples; returns the same list with corrected speaker labels. Any failure (no
+    model, bad audio, too few turns) returns the turns unchanged so a job never breaks.
+    """
+    labels = [turn[2] for turn in turns]
+    if len(set(labels)) < 2 or len(turns) < 3:
+        return turns   # single speaker or too little to disambiguate
+    try:
+        encoder = SpeakerEncoder()
+        audio, file_rate = sf.read(original, dtype='int16')
+    except Exception as exc:
+        print(f'Voice-based turn refinement skipped (unavailable): {exc}', flush=True)
+        return turns
+    if file_rate != rate or audio.ndim != 1:
+        return turns
+
+    embeddings = []
+    for first, last, _speaker, _text in turns:
+        segment = audio[int(first):int(last)]
+        try:
+            embeddings.append(encoder.embed_audio(segment, rate))
+        except Exception:
+            embeddings.append(None)
+
+    def profile_for(label):
+        vectors = [embeddings[i] for i, turn in enumerate(turns)
+                   if turn[2] == label and embeddings[i] is not None]
+        if not vectors:
+            return None
+        summed = np.sum(vectors, axis=0)
+        norm = np.linalg.norm(summed)
+        return summed / norm if norm > 0 else None
+
+    profiles = {label: profile_for(label) for label in set(labels)}
+    refined, moved = [], 0
+    for index, (first, last, speaker, text) in enumerate(turns):
+        new_label = speaker
+        embedding = embeddings[index]
+        own_profile = profiles.get(speaker)
+        if embedding is not None and own_profile is not None:
+            own_score = float(embedding @ own_profile)
+            others = [(float(embedding @ profile), label)
+                      for label, profile in profiles.items()
+                      if label != speaker and profile is not None]
+            if others:
+                best_score, best_label = max(others)
+                if best_score >= REFINE_SCORE and best_score - own_score >= REFINE_MARGIN:
+                    new_label = best_label
+                    moved += 1
+        refined.append((first, last, new_label, text))
+    print(f'Voice-based turn refinement: reassigned {moved}/{len(turns)} turns by voice.', flush=True)
+    return refined

@@ -15,7 +15,7 @@ import soundfile as sf
 from chunk_video import FPS, RATE, probe, run
 from job_logging import log_event
 from render_chunks import frame_count, save_json, valid_render
-from speaker_matching import match_speakers
+from speaker_matching import match_speakers, refine_turns_by_voice
 from tts_api import sdk_client
 from voice_replacement import (
     CLONE_SPEECH_SECONDS, MAX_DUB_TURN_SECONDS, assemble_clone_sample, clone_reference_voice, replace_voice,
@@ -181,6 +181,11 @@ def prepare_sections(job, config):
             log_event(f'{section.name} transcription and speaker diarization started.')
             started = time.monotonic()
             turns = speaker_turns(original, RATE, frames * (RATE // FPS), config['source_language'])
+            if not config['single_speaker']:
+                # Correct 60db's per-turn speaker labels by actual voice, so a mislabeled
+                # segment doesn't get the wrong speaker's clone (and doesn't create a false
+                # speaker change). Falls back to the diarized labels if the voice model fails.
+                turns = refine_turns_by_voice(original, turns)
             save_json(transcript, turns)
             log_event(f'{section.name} transcription finished in {time.monotonic() - started:.1f}s ({len(turns)} turns).')
         if (any(last - first > MAX_DUB_TURN_SECONDS * RATE for first, last, _, _ in turns)
