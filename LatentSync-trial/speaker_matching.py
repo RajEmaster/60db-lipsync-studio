@@ -1,5 +1,5 @@
 """Link section-local diarization labels using CPU WeSpeaker embeddings."""
-from collections import defaultdict
+from collections import Counter, defaultdict
 import hashlib
 from pathlib import Path
 
@@ -16,11 +16,14 @@ MODEL_REVISION = 'f0c48c298fd835726c27956a5d617bad7115627e'
 MODEL_SHA256 = '7bb2f06e9df17cdf1ef14ee8a15ab08ed28e8d0ef5054ee135741560df2ec068'
 MATCH_SCORE = 0.65
 MATCH_MARGIN = 0.08
-# Within a section, only move a turn to a different speaker when its voice clearly matches
-# that speaker better than its diarized one — conservative, so we fix obvious mislabels
-# without disturbing uncertain turns (which could make diarization worse).
-REFINE_SCORE = 0.50     # the other speaker must look like a real match
-REFINE_MARGIN = 0.10    # and beat the diarized speaker by this cosine margin
+# Voice-based per-turn correction, designed so it can NEVER merge two speakers into one.
+# A turn is proposed for a move only when another speaker is a strong match AND clearly beats
+# the turn's own speaker (leave-one-out), which can spot a mislabel even between similar
+# voices. The merge-proofing is the CAP below: at most MAX_MOVE_FRACTION of any speaker's
+# turns may move and it always keeps at least one, so a whole speaker is never collapsed.
+REFINE_TARGET = 0.58      # the other speaker must be a strong match
+REFINE_MARGIN = 0.12      # and clearly beat the turn's own speaker by this cosine margin
+MAX_MOVE_FRACTION = 0.34  # never move more than this share of a speaker's turns (anti-merge)
 
 
 class SpeakerEncoder:
@@ -105,20 +108,31 @@ def match_speakers(job, observations):
     return mapping
 
 
-def refine_turns_by_voice(original, turns, rate=16000):
-    """Correct 60db's per-turn speaker labels using voice embeddings.
+def _mean_embedding(vectors):
+    vectors = [v for v in vectors if v is not None]
+    if not vectors:
+        return None
+    summed = np.sum(vectors, axis=0)
+    norm = np.linalg.norm(summed)
+    return summed / norm if norm > 0 else None
 
-    60db diarization usually gets the speaker COUNT and rough grouping right but mislabels
-    individual segments, which shows up as both wrong turn boundaries (a false speaker change)
-    and the wrong cloned voice on that turn. Here we build a voice profile per diarized
-    speaker (the mean embedding of their turns) and move a turn to another speaker only when
-    its voice clearly matches that speaker better. `turns` is a list of (first, last, speaker,
-    text) in samples; returns the same list with corrected speaker labels. Any failure (no
-    model, bad audio, too few turns) returns the turns unchanged so a job never breaks.
+
+def refine_turns_by_voice(original, turns, rate=16000):
+    """Fix turns 60db clearly mislabeled, using voice embeddings, WITHOUT merging speakers.
+
+    60db usually separates speakers correctly but mislabels the odd segment, which gives a
+    wrong turn boundary and the wrong cloned voice. A turn is moved only when it is a poor
+    match to the REST of its own speaker (a genuine outlier, measured leave-one-out) AND
+    strongly matches another speaker — and no more than a small fraction of any speaker's
+    turns may move, always leaving it at least one. So two distinct speakers (even similar
+    ones) each keep matching their own group and are never collapsed into one. `turns` is a
+    list of (first, last, speaker, text) in samples. Any failure returns the diarized turns
+    unchanged so a job never breaks.
     """
     labels = [turn[2] for turn in turns]
-    if len(set(labels)) < 2 or len(turns) < 3:
-        return turns   # single speaker or too little to disambiguate
+    counts = Counter(labels)
+    if len(counts) < 2 or len(turns) < 4:
+        return turns   # single speaker or too little to disambiguate safely
     try:
         encoder = SpeakerEncoder()
         audio, file_rate = sf.read(original, dtype='int16')
@@ -136,31 +150,49 @@ def refine_turns_by_voice(original, turns, rate=16000):
         except Exception:
             embeddings.append(None)
 
-    def profile_for(label):
-        vectors = [embeddings[i] for i, turn in enumerate(turns)
-                   if turn[2] == label and embeddings[i] is not None]
-        if not vectors:
-            return None
-        summed = np.sum(vectors, axis=0)
-        norm = np.linalg.norm(summed)
-        return summed / norm if norm > 0 else None
+    by_label = defaultdict(list)
+    for index, turn in enumerate(turns):
+        if embeddings[index] is not None:
+            by_label[turn[2]].append(index)
+    profiles = {label: _mean_embedding([embeddings[i] for i in idxs])
+                for label, idxs in by_label.items()}
 
-    profiles = {label: profile_for(label) for label in set(labels)}
-    refined, moved = [], 0
+    # Propose moving only clear outliers that strongly fit another speaker.
+    proposals = {}   # index -> (new_label, confidence)
     for index, (first, last, speaker, text) in enumerate(turns):
-        new_label = speaker
         embedding = embeddings[index]
-        own_profile = profiles.get(speaker)
-        if embedding is not None and own_profile is not None:
-            own_score = float(embedding @ own_profile)
-            others = [(float(embedding @ profile), label)
-                      for label, profile in profiles.items()
-                      if label != speaker and profile is not None]
-            if others:
-                best_score, best_label = max(others)
-                if best_score >= REFINE_SCORE and best_score - own_score >= REFINE_MARGIN:
-                    new_label = best_label
-                    moved += 1
-        refined.append((first, last, new_label, text))
-    print(f'Voice-based turn refinement: reassigned {moved}/{len(turns)} turns by voice.', flush=True)
+        if embedding is None:
+            continue
+        own_profile = _mean_embedding([embeddings[i] for i in by_label.get(speaker, []) if i != index])
+        if own_profile is None:
+            continue   # the only turn of its speaker -> never strand/move it
+        own_score = float(embedding @ own_profile)   # leave-one-out: fit to the REST of its speaker
+        others = [(float(embedding @ profile), label)
+                  for label, profile in profiles.items()
+                  if label != speaker and profile is not None]
+        if not others:
+            continue
+        best_score, best_label = max(others)
+        # Another speaker is a strong match and clearly beats this turn's own speaker. The
+        # per-speaker cap below is what guarantees this can never collapse a whole speaker.
+        if best_score >= REFINE_TARGET and best_score - own_score >= REFINE_MARGIN:
+            proposals[index] = (best_label, best_score - own_score)
+
+    # Anti-merge cap: move at most MAX_MOVE_FRACTION of a speaker's turns, always leaving it
+    # at least one. Apply the most confident moves first. This cannot reduce the speaker count.
+    refined_labels = list(labels)
+    moved = 0
+    by_source = defaultdict(list)
+    for index, (new_label, confidence) in proposals.items():
+        by_source[labels[index]].append((confidence, index, new_label))
+    for source, items in by_source.items():
+        allowed = min(int(counts[source] * MAX_MOVE_FRACTION), counts[source] - 1)
+        for _confidence, index, new_label in sorted(items, reverse=True)[:max(0, allowed)]:
+            refined_labels[index] = new_label
+            moved += 1
+
+    refined = [(first, last, refined_labels[index], text)
+               for index, (first, last, _speaker, text) in enumerate(turns)]
+    print(f'Voice-based turn refinement: reassigned {moved}/{len(turns)} turns '
+          f'(speakers kept: {len(set(refined_labels))}/{len(counts)}).', flush=True)
     return refined
