@@ -214,7 +214,7 @@ def run_long_video(video, job_id, single_speaker, voice_id, source_language,
             'seed': int(seed if seed is not None else 1247),
             'face_restore': bool(face_restore),
             'restore_strength': float(restore_strength if restore_strength is not None else 0.5),
-            'refine_margin': float(refine_margin if refine_margin is not None else 0.12),
+            'refine_margin': float(refine_margin if refine_margin is not None else 0.30),
             **render_settings,
         })
         command += ['--video', video, '--options', str(options)]
@@ -457,10 +457,10 @@ def build_ui():
                 gr.Markdown('### Speakers (multi-speaker only)')
                 with gr.Row():
                     refine_margin = gr.Slider(
-                        0.04, 0.30, value=0.12, step=0.02, label='Voice turn correction',
-                        info='Fixes turns 60db assigned to the wrong speaker, by actual voice. '
-                             'Lower = correct more aggressively; higher = more cautious; 0.30 ≈ off. '
-                             'It can never merge speakers. (Single-speaker jobs ignore this.)',
+                        0.04, 0.30, value=0.30, step=0.02, label='Voice turn correction (0.30 = off)',
+                        info='OFF by default (0.30): speaker turns are left exactly as 60db '
+                             'diarized them. Lower it only to let the system reassign turns to a '
+                             'speaker by voice — it can never merge speakers. Single-speaker jobs ignore this.',
                     )
 
         long_job = gr.Textbox(label='Job ID', info='Shown when a job starts. Paste it here to resume or stop that job.')

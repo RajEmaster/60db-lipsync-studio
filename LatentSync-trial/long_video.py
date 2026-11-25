@@ -185,8 +185,11 @@ def prepare_sections(job, config):
                 # Correct 60db's per-turn speaker labels by actual voice, so a mislabeled
                 # segment doesn't get the wrong speaker's clone (and doesn't create a false
                 # speaker change). Falls back to the diarized labels if the voice model fails.
-                turns = refine_turns_by_voice(original, turns,
-                                              margin=float(config.get('refine_margin', 0.12)))
+                refine_margin = float(config.get('refine_margin', 0.30))
+                # 0.30 = OFF: trust 60db's diarization labels as-is (default). Only when the
+                # user lowers the margin do we attempt voice-based correction of the turns.
+                if refine_margin < 0.30:
+                    turns = refine_turns_by_voice(original, turns, margin=refine_margin)
             save_json(transcript, turns)
             log_event(f'{section.name} transcription finished in {time.monotonic() - started:.1f}s ({len(turns)} turns).')
         if (any(last - first > MAX_DUB_TURN_SECONDS * RATE for first, last, _, _ in turns)
