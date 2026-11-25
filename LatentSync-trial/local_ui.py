@@ -172,7 +172,7 @@ def stop_worker(process):
 def run_long_video(video, job_id, single_speaker, voice_id, source_language,
                    target_language, speed, duration, steps, frames, restore_background, background_gain,
                    engine_version, offload, max_gpus, guidance_scale, crop_smoothing, seed,
-                   face_restore, restore_strength, *render_values):
+                   face_restore, restore_strength, refine_margin, *render_values):
     job_id = (job_id or '').strip().lower()
     if job_id and (len(job_id) != 32 or any(c not in '0123456789abcdef' for c in job_id)):
         raise gr.Error('Enter the 32-character long-video job ID.')
@@ -214,6 +214,7 @@ def run_long_video(video, job_id, single_speaker, voice_id, source_language,
             'seed': int(seed if seed is not None else 1247),
             'face_restore': bool(face_restore),
             'restore_strength': float(restore_strength if restore_strength is not None else 0.5),
+            'refine_margin': float(refine_margin if refine_margin is not None else 0.12),
             **render_settings,
         })
         command += ['--video', video, '--options', str(options)]
@@ -453,6 +454,14 @@ def build_ui():
                         0.0, 1.0, value=0.5, step=0.05, label='Restoration strength',
                         info='Blend of restored vs original. Lower = subtler, less flicker/identity drift.',
                     )
+                gr.Markdown('### Speakers (multi-speaker only)')
+                with gr.Row():
+                    refine_margin = gr.Slider(
+                        0.04, 0.30, value=0.12, step=0.02, label='Voice turn correction',
+                        info='Fixes turns 60db assigned to the wrong speaker, by actual voice. '
+                             'Lower = correct more aggressively; higher = more cautious; 0.30 ≈ off. '
+                             'It can never merge speakers. (Single-speaker jobs ignore this.)',
+                    )
 
         long_job = gr.Textbox(label='Job ID', info='Shown when a job starts. Paste it here to resume or stop that job.')
         with gr.Row():
@@ -467,7 +476,7 @@ def build_ui():
         render_inputs = [long_single, long_voice, source_language, target_language, speed,
                          long_duration, steps, frames, restore_background, background_gain,
                          engine_version, offload, max_gpus, guidance_scale, crop_smoothing, seed,
-                         face_restore, restore_strength,
+                         face_restore, restore_strength, refine_margin,
                          section_seconds, boundary_search, vad_pause, clip_min, clip_target,
                          clip_max, overlap, cpu_threads]
 

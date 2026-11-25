@@ -117,7 +117,7 @@ def _mean_embedding(vectors):
     return summed / norm if norm > 0 else None
 
 
-def refine_turns_by_voice(original, turns, rate=16000):
+def refine_turns_by_voice(original, turns, rate=16000, margin=REFINE_MARGIN):
     """Fix turns 60db clearly mislabeled, using voice embeddings, WITHOUT merging speakers.
 
     60db usually separates speakers correctly but mislabels the odd segment, which gives a
@@ -175,7 +175,7 @@ def refine_turns_by_voice(original, turns, rate=16000):
         best_score, best_label = max(others)
         # Another speaker is a strong match and clearly beats this turn's own speaker. The
         # per-speaker cap below is what guarantees this can never collapse a whole speaker.
-        if best_score >= REFINE_TARGET and best_score - own_score >= REFINE_MARGIN:
+        if best_score >= REFINE_TARGET and best_score - own_score >= margin:
             proposals[index] = (best_label, best_score - own_score)
 
     # Anti-merge cap: move at most MAX_MOVE_FRACTION of a speaker's turns, always leaving it
