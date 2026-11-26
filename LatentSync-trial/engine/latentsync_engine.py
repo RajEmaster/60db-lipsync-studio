@@ -49,7 +49,10 @@ ENGINE_VERSIONS = {
 }
 
 # Below this much total VRAM (MiB) 'auto' prefers swapping over keeping both models resident.
-RESIDENT_VRAM_FLOOR_MIB = {'1.5': 10_000, '1.6': 22_000}
+# 1.5 (256px) peaks at ~3 GB, so keep it resident on any >=5 GB card: swap re-runs
+# torch.cuda.empty_cache() on EVERY UNet forward (per-step), which dominates render time on
+# small GPUs. 1.6 (512px) genuinely needs the headroom, so its floor stays high.
+RESIDENT_VRAM_FLOOR_MIB = {'1.5': 5_000, '1.6': 22_000}
 
 
 @dataclass
