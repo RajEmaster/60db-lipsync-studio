@@ -245,9 +245,29 @@ def synthesize(text, voice=DEFAULT_VOICE, speed=0.7):
     return str(output)
 
 
+TRANSIENT_HTTP = (500, 502, 503, 504)
+
+
+def _speech_to_text(audio_path, **kwargs):
+    """Call 60db STT, retrying transient server errors (502/503/504/timeouts).
+
+    Per-turn re-transcription makes many small STT calls, so one transient blip
+    must not abort a whole job. Non-transient errors (bad key, limits) raise at once.
+    """
+    for attempt in range(4):
+        try:
+            with sdk_client() as client, Path(audio_path).open('rb') as audio:
+                return client.speech_to_text(audio, **kwargs)
+        except RuntimeError as exc:
+            message = str(exc)
+            transient = 'timed out' in message or any(f'HTTP {code}' in message for code in TRANSIENT_HTTP)
+            if not transient or attempt == 3:
+                raise
+            time.sleep(1.5 * (attempt + 1))
+
+
 def transcribe(audio_path, language=None):
-    with sdk_client() as client, Path(audio_path).open('rb') as audio:
-        result = client.speech_to_text(audio, language=language)
+    result = _speech_to_text(audio_path, language=language)
     for _ in range(3):
         if isinstance(result, str):
             return result.strip()
@@ -272,8 +292,7 @@ def transcribe_speakers(audio_path, language=None):
     (60db warns with `speaker_alignment_unavailable`), so callers must prefer the
     `speakers` array and recover each turn's text by re-transcribing its slice.
     """
-    with sdk_client() as client, Path(audio_path).open('rb') as audio:
-        result = client.speech_to_text(audio, language=language, diarize=True)
+    result = _speech_to_text(audio_path, language=language, diarize=True)
     if isinstance(result, dict):
         result = result.get('data', result)
     if not isinstance(result, dict) or not (

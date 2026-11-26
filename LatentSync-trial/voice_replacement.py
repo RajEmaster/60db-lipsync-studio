@@ -233,7 +233,13 @@ def _turns_from_diarization(original, diarization, rate, sample_count, language)
                 continue
             source.seek(first)
             sf.write(sample, source.read(last - first, dtype='int16'), rate, subtype='PCM_16')
-            text = transcribe(sample, language)
+            try:
+                text = transcribe(sample, language)
+            except Exception as exc:
+                # One turn's STT failing (even after retries) must not kill the whole job;
+                # skip this turn so the rest of the dialogue still dubs.
+                print(f'Skipped a {(last - first) / rate:.2f}s turn; 60db transcription failed: {exc}', flush=True)
+                continue
             if text:
                 turns.append((first, last, speaker, text))
                 boundary = last
