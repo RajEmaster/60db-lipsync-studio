@@ -264,13 +264,23 @@ def transcribe(audio_path, language=None):
 
 
 def transcribe_speakers(audio_path, language=None):
+    """Return 60db's full diarized STT result (both `segments` and `speakers`).
+
+    The response carries a coarse `segments` transcription AND a separate
+    `speakers` array of per-speaker time ranges — the actual diarization. On
+    backends without word alignment the segment text is NOT split per speaker
+    (60db warns with `speaker_alignment_unavailable`), so callers must prefer the
+    `speakers` array and recover each turn's text by re-transcribing its slice.
+    """
     with sdk_client() as client, Path(audio_path).open('rb') as audio:
         result = client.speech_to_text(audio, language=language, diarize=True)
     if isinstance(result, dict):
         result = result.get('data', result)
-    if not isinstance(result, dict) or not isinstance(result.get('segments'), list):
+    if not isinstance(result, dict) or not (
+        isinstance(result.get('speakers'), list) or isinstance(result.get('segments'), list)
+    ):
         raise RuntimeError('60db returned no speaker segments.')
-    return result['segments']
+    return result
 
 
 def detect_spoken_language(audio_path):

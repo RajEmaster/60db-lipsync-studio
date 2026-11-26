@@ -171,11 +171,81 @@ def spoken_sample_bounds(path):
             min(len(audio), (int(active[-1]) + 1) * window + margin), rate, len(audio))
 
 
+DIAR_MERGE_GAP_SECONDS = 0.6   # merge consecutive same-speaker diarization turns across gaps this small
+DIAR_MIN_TURN_SECONDS = 0.35   # drop diarization fragments shorter than this (backchannel/noise)
+
+
 def speaker_turns(original, rate, sample_count, language):
     if original.stat().st_size > 100_000_000:
         raise ValueError('The audio exceeds the 60db transcription upload limit. Use a shorter video or a render length limit.')
+    result = transcribe_speakers(original, language)
+    diarization = result.get('speakers') if isinstance(result, dict) else None
+    # Prefer 60db's real diarization (`speakers` array). On this backend the `segments`
+    # text is NOT split per speaker, so reading it collapses every speaker into one turn.
+    if isinstance(diarization, list) and any(
+            isinstance(item, dict) and item.get('speaker') for item in diarization):
+        turns = _turns_from_diarization(original, diarization, rate, sample_count, language)
+        if turns:
+            return turns
+    # Fallback: backends that DO split text per speaker inside `segments`.
+    return _turns_from_segments(result.get('segments') if isinstance(result, dict) else result,
+                                rate, sample_count)
+
+
+def _turns_from_diarization(original, diarization, rate, sample_count, language):
+    """Build per-speaker turns from 60db's `speakers` array.
+
+    60db diarizes into per-speaker time ranges but (on this backend) gives no
+    per-speaker text, so each turn's words are recovered by re-transcribing its
+    own audio slice. Adjacent same-speaker turns are merged across small gaps and
+    micro-fragments are dropped, so a few clean turns replace many raw ones.
+    """
+    ranges = []
+    for item in diarization:
+        speaker = item.get('speaker')
+        try:
+            start, end = float(item['start']), float(item['end'])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if isinstance(speaker, str) and speaker.strip() and end > start:
+            ranges.append([start, end, speaker.strip()])
+    if not ranges:
+        return []
+    ranges.sort(key=lambda r: r[0])
+    merged = [ranges[0]]
+    for start, end, speaker in ranges[1:]:
+        last = merged[-1]
+        if speaker == last[2] and start - last[1] <= DIAR_MERGE_GAP_SECONDS:
+            last[1] = max(last[1], end)   # same speaker, small gap -> one turn
+        else:
+            merged.append([start, end, speaker])
+    kept = [r for r in merged if r[1] - r[0] >= DIAR_MIN_TURN_SECONDS]
+    if not kept:   # never strand a whole section: keep the single longest turn
+        kept = [max(merged, key=lambda r: r[1] - r[0])]
     turns = []
-    for segment in transcribe_speakers(original, language):
+    with TemporaryDirectory() as temp, sf.SoundFile(original) as source:
+        sample = Path(temp) / 'turn.wav'
+        boundary = 0
+        for start, end, speaker in kept:
+            first = max(boundary, round(start * rate))   # keep turns non-overlapping and ordered
+            last = min(sample_count, round(end * rate))
+            if last <= first:
+                continue
+            source.seek(first)
+            sf.write(sample, source.read(last - first, dtype='int16'), rate, subtype='PCM_16')
+            text = transcribe(sample, language)
+            if text:
+                turns.append((first, last, speaker, text))
+                boundary = last
+    return turns
+
+
+def _turns_from_segments(segments, rate, sample_count):
+    """Fallback for backends whose `segments` already carry per-speaker text."""
+    if not isinstance(segments, list):
+        raise RuntimeError('60db returned no speaker segments.')
+    turns = []
+    for segment in segments:
         text = (segment.get('text') or '').strip()
         if not text:
             continue

@@ -28,27 +28,42 @@ def speech_timestamps(speech_audio, job, minimum_pause=0.3):
     return json.loads(output.read_text(encoding='utf-8'))
 
 
-def extract_background(original_video, job, speech_duration, cpu_threads=4):
-    """Estimate background from the ORIGINAL soundtrack, never from generated TTS."""
+def separate_stems(original_video, folder, duration, cpu_threads=4, reuse=True):
+    """Split the ORIGINAL soundtrack into (speech_voice, background) stems.
+
+    Returns (voice_path, background_path), or (None, None) when the source has no
+    audio. The stems are written side by side so the early speech-cleaning pass
+    (transcribe/diarize/clone on clean vocals) and the later background mix never
+    run Demucs on the same section twice: `reuse` returns existing stems as-is.
+    """
+    folder = Path(folder)
+    folder.mkdir(parents=True, exist_ok=True)
+    voice, background = folder / 'speaker_voice.wav', folder / 'background.wav'
+    if reuse and voice.is_file() and background.is_file():
+        return voice, background
     info = probe(original_video)
     if not any(stream['codec_type'] == 'audio' for stream in info['streams']):
-        print('Reference video has no audio; final soundtrack will contain speech only.', flush=True)
-        return None
+        print('Reference video has no audio; speech cleaning / background skipped.', flush=True)
+        return None, None
     video_stream = next(stream for stream in info['streams'] if stream['codec_type'] == 'video')
     reference_duration = float(video_stream.get('duration') or info['format']['duration'])
-    duration = min(speech_duration, reference_duration)
+    duration = min(duration, reference_duration)
     samples = round(duration * SAMPLE_RATE)
-    folder = job / 'original_audio'
-    folder.mkdir(exist_ok=True)
     mix = folder / 'original_mix.wav'
     run(['ffmpeg', '-hide_banner', '-loglevel', 'error', '-y', '-i', str(original_video),
          '-vn', '-af', f'aresample={SAMPLE_RATE},apad,atrim=end_sample={samples}',
          '-ar', str(SAMPLE_RATE), '-ac', '2', '-c:a', 'pcm_f32le', str(mix)])
-    print('Separating original vocals from background on CPU...', flush=True)
+    print('Separating speech from background...', flush=True)
     subprocess.run([str(SEPARATOR_PYTHON), '-u', str(ROOT.parent / 'background-audio' / 'separate_voice.py'),
                     '--input', str(mix), '--output', str(folder),
                     '--cpu-threads', str(cpu_threads)], check=True)
-    return folder / 'background.wav'
+    return voice, background
+
+
+def extract_background(original_video, job, speech_duration, cpu_threads=4):
+    """Background stem of the ORIGINAL soundtrack (reuses the early speech-clean pass)."""
+    _voice, background = separate_stems(original_video, job / 'original_audio', speech_duration, cpu_threads)
+    return background
 
 
 def build_soundtrack(speech, background, output, duration, background_gain=1.0):

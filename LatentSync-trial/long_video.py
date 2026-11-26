@@ -12,6 +12,7 @@ import time
 
 import soundfile as sf
 
+from audio_pipeline import separate_stems
 from chunk_video import FPS, RATE, probe, run
 from job_logging import log_event
 from render_chunks import frame_count, save_json, valid_render
@@ -173,6 +174,17 @@ def prepare_sections(job, config):
         started = time.monotonic()
         reference, original = take_section(job / config['source'], section, start, frames)
         log_event(f'{section.name} media ready in {time.monotonic() - started:.1f}s.')
+        if config.get('clean_speech', True):
+            # Noisy/music clips: separate speech from background FIRST, then transcribe,
+            # diarize and clone on the clean vocals. The same stems feed the final
+            # background mix at render time, so Demucs runs once per section, not twice.
+            voice, _background = separate_stems(reference, section / 'original_audio',
+                                                frames / FPS, config['cpu_threads'])
+            if voice is not None:
+                run(['ffmpeg', '-hide_banner', '-loglevel', 'error', '-y', '-i', str(voice),
+                     '-vn', '-af', f'aresample={RATE},apad,atrim=end_sample={frames * (RATE // FPS)}',
+                     '-ar', str(RATE), '-ac', '1', '-c:a', 'pcm_s16le', str(original)])
+                log_event(f'{section.name} speech cleaned; diarization and cloning use the separated vocals.')
         transcript = section / 'turns.json'
         if transcript.exists():
             turns = read_json(transcript)
@@ -256,6 +268,7 @@ def section_voice_resolver(job, config, mapping, observations, sections):
             best[identity] = item
     if config.get('voice_id'):
         return lambda section, identity: config['voice_id']
+    fixed = {label: vid for label, vid in (config.get('speaker_voices') or {}).items() if vid}
     turns_by_speaker = {}
     for section, _, _, turns in sections:
         original = section / 'speech' / 'original_speech.wav'
@@ -267,6 +280,13 @@ def section_voice_resolver(job, config, mapping, observations, sections):
 
     def resolve(section, identity):
         nonlocal last_scope
+        if fixed.get(identity):
+            # User pinned a fixed 60db voice for this speaker: never auto-clone it.
+            if voices.get(identity) != fixed[identity]:
+                voices[identity] = fixed[identity]
+                save_json(path, voices)
+                log_event(f'Using the pinned 60db voice for {identity}.')
+            return fixed[identity]
         scope = (section.name, identity)
         if last_scope == scope:
             return voices[identity]

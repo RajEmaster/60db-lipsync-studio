@@ -1,6 +1,7 @@
 """Lipsyncstudio UI with uploaded speech and a 60db TTS API connection."""
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -169,10 +170,38 @@ def stop_worker(process):
         process.wait()
 
 
+def parse_speaker_voices(text):
+    """Parse the per-speaker voice box into {'Speaker N': voice_id}.
+
+    One speaker per line. Accepts 'Speaker 2 = id', 'Speaker 2: id', '2: id', or a
+    bare voice id (assigned to Speaker 1, 2, 3... in the order the lines appear).
+    Blank lines and '#' comments are ignored. Any speaker left out auto-clones as
+    before, so a half-filled box pins only the speakers you name.
+    """
+    mapping = {}
+    position = 0
+    for raw in (text or '').splitlines():
+        line = raw.strip()
+        if not line or line.startswith('#'):
+            continue
+        position += 1
+        match = re.match(r'^(.*?)\s*[:=]\s*(.+)$', line)
+        if match:
+            label, value = match.group(1).strip(), match.group(2).strip()
+            number = re.match(r'(?i)^speaker\s*(\d+)$', label) or re.match(r'^(\d+)$', label)
+            if number:
+                label = f'Speaker {number.group(1)}'
+        else:
+            label, value = f'Speaker {position}', line
+        if value:
+            mapping[label] = value
+    return mapping
+
+
 def run_long_video(video, job_id, single_speaker, voice_id, source_language,
                    target_language, speed, duration, steps, frames, restore_background, background_gain,
-                   engine_version, offload, max_gpus, guidance_scale, crop_smoothing, seed,
-                   face_restore, restore_strength, refine_margin, *render_values):
+                   clean_speech, engine_version, offload, max_gpus, guidance_scale, crop_smoothing, seed,
+                   face_restore, restore_strength, refine_margin, speaker_voices_text, *render_values):
     job_id = (job_id or '').strip().lower()
     if job_id and (len(job_id) != 32 or any(c not in '0123456789abcdef' for c in job_id)):
         raise gr.Error('Enter the 32-character long-video job ID.')
@@ -206,6 +235,7 @@ def run_long_video(video, job_id, single_speaker, voice_id, source_language,
             'target_language': target_language, 'speed': speed,
             'duration': float(duration or 0), 'steps': int(steps), 'batch_frames': int(frames),
             'restore_background': restore_background, 'background_gain': background_gain,
+            'clean_speech': bool(clean_speech),
             'engine_version': (engine_version or '1.5').strip(),
             'offload': (offload or 'auto').strip(), 'engine_mode': 'resident',
             'max_gpus': int(max_gpus or 0),
@@ -215,6 +245,7 @@ def run_long_video(video, job_id, single_speaker, voice_id, source_language,
             'face_restore': bool(face_restore),
             'restore_strength': float(restore_strength if restore_strength is not None else 0.5),
             'refine_margin': float(refine_margin if refine_margin is not None else 0.30),
+            'speaker_voices': {} if single_speaker else parse_speaker_voices(speaker_voices_text),
             **render_settings,
         })
         command += ['--video', video, '--options', str(options)]
@@ -363,6 +394,12 @@ def build_ui():
                 speed = gr.Slider(0.5, 2.0, value=1.0, step=0.05, label='Speaking speed')
                 restore_background = gr.Checkbox(value=True, label='Restore original background music / noise')
                 background_gain = gr.Slider(0, 1, value=1, step=0.05, label='Background volume')
+                clean_speech = gr.Checkbox(
+                    value=True, label='Clean speech before transcription (noisy / music clips)',
+                    info='Separate speech from background FIRST, then transcribe, diarize and '
+                         'clone on the clean vocals — big win for movie clips. The same separation '
+                         'feeds the background mix, so it runs once. Turn off for clean studio audio to save time.',
+                )
 
             with gr.Column():
                 gr.Markdown('### Sections and render clips')
@@ -406,8 +443,9 @@ def build_ui():
                     steps = gr.Slider(2, 50, value=20, step=1, label='Inference steps',
                                       info='Use 20-30 for real quality. Below ~10 the mouth is '
                                            'blurry/unsynced (those are smoke-test values only).')
-                    frames = gr.Dropdown([4, 8, 16], value=16, label='Frames per batch',
-                                         info='Choose 4 or 8 to reduce VRAM use.')
+                    frames = gr.Dropdown([4, 8, 16], value=8, label='Frames per batch',
+                                         info='8 = default, best sync/sharpness in our tests. '
+                                              '16 = smoother but softer; 4 = lowest VRAM.')
                     cpu_threads = gr.Slider(
                         1, 16, step=1, value=LONG_RENDER_DEFAULTS['cpu_threads'], label='PyTorch CPU threads',
                     )
@@ -462,6 +500,14 @@ def build_ui():
                              'diarized them. Lower it only to let the system reassign turns to a '
                              'speaker by voice — it can never merge speakers. Single-speaker jobs ignore this.',
                     )
+                speaker_voices_text = gr.Textbox(
+                    label='Per-speaker voice IDs (optional)', lines=3,
+                    placeholder='Speaker 1: <60db voice id>\nSpeaker 2: <60db voice id>',
+                    info='Pin a fixed 60db voice to each speaker instead of auto-cloning. '
+                         'One per line (blank = auto-clone that speaker as before). Speaker '
+                         'labels (Speaker 1, Speaker 2...) appear in the job progress log — run '
+                         'once to see who is who, then paste IDs here and resume/rerun.',
+                )
 
         long_job = gr.Textbox(label='Job ID', info='Shown when a job starts. Paste it here to resume or stop that job.')
         with gr.Row():
@@ -475,8 +521,8 @@ def build_ui():
         # Inputs passed to run_long_video after (video, job_id), in its exact order.
         render_inputs = [long_single, long_voice, source_language, target_language, speed,
                          long_duration, steps, frames, restore_background, background_gain,
-                         engine_version, offload, max_gpus, guidance_scale, crop_smoothing, seed,
-                         face_restore, restore_strength, refine_margin,
+                         clean_speech, engine_version, offload, max_gpus, guidance_scale, crop_smoothing, seed,
+                         face_restore, restore_strength, refine_margin, speaker_voices_text,
                          section_seconds, boundary_search, vad_pause, clip_min, clip_target,
                          clip_max, overlap, cpu_threads]
 
