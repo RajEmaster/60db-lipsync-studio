@@ -56,12 +56,27 @@ def _settings_from_args(args):
     return settings
 
 
+def _emit(result, json_out):
+    """Write the machine-readable result to a file if asked, else print it.
+
+    Pipeline progress logs go to stdout; when --json-out is given we keep the
+    result out of that stream so callers (scripts, the worker) parse a clean file.
+    """
+    if json_out:
+        out = Path(json_out)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding='utf-8')
+        print(f'[result written to {out}]')
+    else:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+
+
 def cmd_analyze(args):
     manifest = svc.analyze(
         args.media, args.work_root,
         source_language=args.source_language,
         settings=_settings_from_args(args))
-    print(json.dumps(manifest, indent=2, ensure_ascii=False))
+    _emit(manifest, args.json_out)
 
 
 def cmd_synthesize(args):
@@ -75,7 +90,7 @@ def cmd_synthesize(args):
         out.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(video), str(out))   # deliver to the caller, keep nothing
         result['video_path'] = str(out)
-    print(json.dumps(result, indent=2, ensure_ascii=False))
+    _emit(result, args.json_out)
 
 
 def cmd_release(args):
@@ -98,6 +113,7 @@ def build_parser():
     a.add_argument('media')
     a.add_argument('--source-language', default=None)
     a.add_argument('--section-seconds', type=float, default=None)
+    a.add_argument('--json-out', default=None, help='Write the manifest JSON to this file.')
     a.set_defaults(func=cmd_analyze)
 
     s = sub.add_parser('synthesize', help='Render one section in a target language.')
@@ -111,6 +127,7 @@ def build_parser():
     s.add_argument('--seed', type=int, default=None)
     s.add_argument('--guidance-scale', dest='guidance_scale', type=float, default=None)
     s.add_argument('--speed', type=float, default=None)
+    s.add_argument('--json-out', default=None, help='Write the result JSON to this file.')
     s.set_defaults(func=cmd_synthesize)
 
     r = sub.add_parser('release', help='Drop a prepared selection.')
