@@ -97,6 +97,19 @@ _OFFLOAD_MODES = ('auto', 'resident', 'swap')
 DEFAULT_TTL_SECONDS = 1800   # prepared selections expire after 30 min of no use
 
 
+def defaults():
+    """The default settings the service uses unless a call overrides them, plus the
+    allowed values for the enumerated ones. Lets clients show/seed the real defaults."""
+    return {
+        'defaults': dict(_DEFAULTS),
+        'allowed': {
+            'frames': list(_ALLOWED_FRAMES),
+            'engine_version': list(_ENGINE_VERSIONS),
+            'offload': list(_OFFLOAD_MODES),
+        },
+    }
+
+
 def _validated_settings(overrides):
     """Merge caller overrides over the defaults, rejecting unknown/invalid keys."""
     if overrides is None:
@@ -334,6 +347,12 @@ def synthesize(selection_id, section_id, target_language, work_root,
                 restore_strength=float(settings['restore_strength']),
                 offload=settings['offload'], max_gpus=int(settings['max_gpus']),
                 engine_version=settings['engine_version'], cpu_threads=int(settings['cpu_threads']),
+                # render chunking within the section (changeable per synthesize)
+                clip_min_seconds=float(settings['clip_min_seconds']),
+                clip_target_seconds=float(settings['clip_target_seconds']),
+                clip_max_seconds=float(settings['clip_max_seconds']),
+                overlap_seconds=float(settings['overlap_seconds']),
+                vad_pause_seconds=float(settings['vad_pause_seconds']),
             )
             sections, observations = prepare_sections(workdir, config)   # cached -> cheap
             mapping = speaker_map(workdir, config, observations)

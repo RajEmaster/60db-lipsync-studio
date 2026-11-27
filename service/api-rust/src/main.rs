@@ -115,13 +115,69 @@ struct Manifest {
     sections: Vec<Section>,
 }
 
-#[derive(Serialize, Deserialize, ToSchema)]
+/// All settings are optional; omitted ones use vetted defaults. Render settings apply
+/// to synthesize; chunking settings apply to analyze.
+#[derive(Serialize, Deserialize, ToSchema, Default)]
+#[serde(default)]
 struct Settings {
-    #[schema(example = 20)] steps: Option<u32>,
-    #[schema(example = 8)] frames: Option<u32>,
-    #[schema(example = 1.5)] guidance_scale: Option<f64>,
-    #[schema(example = 1247)] seed: Option<u64>,
-    #[schema(example = 1.0)] speed: Option<f64>,
+    // ---- render settings (synthesize) ----
+    /// Inference steps. 12 = quick preview, 20-30 = quality.
+    #[serde(skip_serializing_if = "Option::is_none")] #[schema(example = 20)]
+    steps: Option<u32>,
+    /// Frames per batch: 4, 8 or 16 (8 default).
+    #[serde(skip_serializing_if = "Option::is_none")] #[schema(example = 8)]
+    frames: Option<u32>,
+    /// Audio-guidance strength 1.0–2.5 (how hard the mouth follows the voice).
+    #[serde(skip_serializing_if = "Option::is_none")] #[schema(example = 1.5)]
+    guidance_scale: Option<f64>,
+    /// Mouth stability / anti-flutter 0.2–0.6.
+    #[serde(skip_serializing_if = "Option::is_none")] #[schema(example = 0.4)]
+    crop_smoothing: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")] #[schema(example = 1247)]
+    seed: Option<u64>,
+    /// TTS speaking speed 0.5–2.0.
+    #[serde(skip_serializing_if = "Option::is_none")] #[schema(example = 1.0)]
+    speed: Option<f64>,
+    /// Keep the original background music/noise under the dub.
+    #[serde(skip_serializing_if = "Option::is_none")] #[schema(example = true)]
+    restore_background: Option<bool>,
+    /// Background volume 0.0–1.0.
+    #[serde(skip_serializing_if = "Option::is_none")] #[schema(example = 1.0)]
+    background_gain: Option<f64>,
+    /// GFPGAN face restoration on the generated mouth.
+    #[serde(skip_serializing_if = "Option::is_none")] #[schema(example = false)]
+    face_restore: Option<bool>,
+    /// Face-restoration strength 0.0–1.0.
+    #[serde(skip_serializing_if = "Option::is_none")] #[schema(example = 0.5)]
+    restore_strength: Option<f64>,
+    /// LatentSync version: "1.5" (256px, fast) or "1.6" (512px, sharper, needs big VRAM).
+    #[serde(skip_serializing_if = "Option::is_none")] #[schema(example = "1.5")]
+    engine_version: Option<String>,
+    /// GPU memory mode: "auto" | "resident" | "swap".
+    #[serde(skip_serializing_if = "Option::is_none")] #[schema(example = "auto")]
+    offload: Option<String>,
+    /// Target render clip length (seconds) within the section.
+    #[serde(skip_serializing_if = "Option::is_none")] #[schema(example = 17.0)]
+    clip_target_seconds: Option<f64>,
+    /// Render clip overlap per side (seconds).
+    #[serde(skip_serializing_if = "Option::is_none")] #[schema(example = 0.4)]
+    overlap_seconds: Option<f64>,
+    // ---- chunking settings (analyze) ----
+    /// Max section length in seconds (chunk size), 10–600.
+    #[serde(skip_serializing_if = "Option::is_none")] #[schema(example = 300.0)]
+    section_seconds: Option<f64>,
+    /// Minimum silence (seconds) that counts as a pause, 0.1–2.0.
+    #[serde(skip_serializing_if = "Option::is_none")] #[schema(example = 0.3)]
+    vad_pause_seconds: Option<f64>,
+    /// Separate speech from background before transcribing (best for noisy clips).
+    #[serde(skip_serializing_if = "Option::is_none")] #[schema(example = true)]
+    clean_speech: Option<bool>,
+    /// Pause search per side when cutting sections (seconds), 0–30.
+    #[serde(skip_serializing_if = "Option::is_none")] #[schema(example = 12.0)]
+    boundary_search_seconds: Option<f64>,
+    /// PyTorch CPU threads 1–16.
+    #[serde(skip_serializing_if = "Option::is_none")] #[schema(example = 4)]
+    cpu_threads: Option<u32>,
 }
 
 #[derive(Serialize, Deserialize, ToSchema)]
@@ -228,7 +284,7 @@ async fn swagger_css() -> impl IntoResponse {
 /// multipart/form-data under `file` (optional `source_language`). Returns a job id;
 /// poll it, and the done job's `manifest` holds the sections + turns.
 #[utoipa::path(post, path = "/v1/analyze", tag = "service",
-    request_body(content_type = "multipart/form-data", description = "file=<video>, source_language=<optional>"),
+    request_body(content_type = "multipart/form-data", description = "Fields: file=<video> (required), source_language=<optional>, settings=<optional JSON object of chunking settings: section_seconds, vad_pause_seconds, clean_speech, boundary_search_seconds, cpu_threads>"),
     responses(
         (status = 202, description = "Job enqueued", body = JobAccepted),
         (status = 400, description = "Invalid input", body = ErrorResponse),
@@ -236,6 +292,7 @@ async fn swagger_css() -> impl IntoResponse {
 async fn analyze(State(st): State<Shared>, mut form: Multipart) -> Response {
     let mut upload: Option<PathBuf> = None;
     let mut source_language: Option<String> = None;
+    let mut settings_json: Option<String> = None;
 
     loop {
         let field = match form.next_field().await {
@@ -244,6 +301,9 @@ async fn analyze(State(st): State<Shared>, mut form: Multipart) -> Response {
             Err(e) => return bad_request(&format!("malformed multipart: {e}")),
         };
         match field.name().unwrap_or("") {
+            "settings" => {
+                settings_json = field.text().await.ok().filter(|s| !s.trim().is_empty());
+            }
             "file" => {
                 let ext = field
                     .file_name()
@@ -276,7 +336,7 @@ async fn analyze(State(st): State<Shared>, mut form: Multipart) -> Response {
     insert_job(&st, &job_id, "analyze");
     let st2 = st.clone();
     let id2 = job_id.clone();
-    tokio::spawn(async move { run_analyze(st2, id2, upload, source_language).await });
+    tokio::spawn(async move { run_analyze(st2, id2, upload, source_language, settings_json).await });
 
     accepted(&job_id)
 }
@@ -377,6 +437,17 @@ async fn voices(State(st): State<Shared>) -> Response {
     }
 }
 
+/// The default settings the service uses (and the allowed values), so a client can
+/// show them and send only the ones it wants to change on synthesize/analyze.
+#[utoipa::path(get, path = "/v1/defaults", tag = "service",
+    responses((status = 200, description = "Default settings + allowed values")))]
+async fn defaults(State(st): State<Shared>) -> Response {
+    match worker_json(&st.cfg, &["defaults"]).await {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => server_error(&e),
+    }
+}
+
 /// Release a prepared selection and everything cached for it.
 #[utoipa::path(delete, path = "/v1/selections/{selection_id}", tag = "service",
     params(("selection_id" = String, Path, description = "Selection handle from analyze")),
@@ -418,7 +489,8 @@ async fn cancel_job(State(st): State<Shared>, Path(job_id): Path<String>) -> Res
 
 // ============================================================ workers
 
-async fn run_analyze(st: Shared, job_id: String, upload: PathBuf, lang: Option<String>) {
+async fn run_analyze(st: Shared, job_id: String, upload: PathBuf, lang: Option<String>,
+                     settings_json: Option<String>) {
     st.set(&job_id, |j| { j.status = "running".into(); j.progress = 0.1; });
     let result = st.cfg.tmp_dir.join(format!("{job_id}.manifest.json"));
 
@@ -429,6 +501,9 @@ async fn run_analyze(st: Shared, job_id: String, upload: PathBuf, lang: Option<S
         .arg("--json-out").arg(&result);
     if let Some(l) = lang {
         cmd.arg("--source-language").arg(l);
+    }
+    if let Some(s) = settings_json {
+        cmd.arg("--settings-json").arg(s);
     }
 
     let out = cmd.output().await;
@@ -477,11 +552,11 @@ async fn run_synthesize(st: Shared, job_id: String, req: SynthesizeRequest) {
         }
     }
     if let Some(s) = &req.settings {
-        if let Some(v) = s.steps { cmd.arg("--steps").arg(v.to_string()); }
-        if let Some(v) = s.frames { cmd.arg("--frames").arg(v.to_string()); }
-        if let Some(v) = s.seed { cmd.arg("--seed").arg(v.to_string()); }
-        if let Some(v) = s.guidance_scale { cmd.arg("--guidance-scale").arg(v.to_string()); }
-        if let Some(v) = s.speed { cmd.arg("--speed").arg(v.to_string()); }
+        if let Ok(spec) = serde_json::to_string(s) {
+            if spec != "{}" {
+                cmd.arg("--settings-json").arg(spec);
+            }
+        }
     }
 
     let out = cmd.output().await;
@@ -585,7 +660,7 @@ fn server_error(message: &str) -> Response {
                        section in a target language. Outputs are never stored."
     ),
     paths(healthz, analyze, synthesize, job_status, file_download,
-          languages, voices, release_selection, cancel_job),
+          languages, voices, defaults, release_selection, cancel_job),
     components(schemas(
         Turn, Section, Manifest, Settings, SynthesizeRequest,
         JobAccepted, JobStatus, ErrorResponse
@@ -672,6 +747,7 @@ async fn main() {
         .route("/v1/files/:job_id", get(file_download))
         .route("/v1/languages", get(languages))
         .route("/v1/voices", get(voices))
+        .route("/v1/defaults", get(defaults))
         .route("/v1/selections/:selection_id", axum::routing::delete(release_selection))
         .with_state(state)
         // The web UI (served from disk so it can be tuned without a rebuild). Any path

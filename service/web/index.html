@@ -8,71 +8,131 @@
 </head>
 <body>
   <header class="topbar">
-    <div class="brand">🎬 Lipsync Dubbing Studio</div>
-    <div class="links">
+    <div class="brand"><span class="logo">◑</span> Lipsync&nbsp;Dubbing&nbsp;Studio</div>
+    <nav class="links">
       <span id="health" class="pill">checking…</span>
       <a href="/docs" target="_blank">API docs</a>
-    </div>
+      <a href="/api-doc/openapi.json" target="_blank">OpenAPI</a>
+    </nav>
   </header>
 
+  <section class="hero">
+    <h1>Dub a video, one chunk at a time.</h1>
+    <p>Upload → we split it into chunks and transcribe each → test a chunk in any language,
+       tune the settings, then let your app run the rest. The API works per chunk — clean,
+       discrete, and it never stores your output.</p>
+  </section>
+
   <main>
-    <!-- Step 1 -->
+    <!-- STEP 1 — Upload & chunk -->
     <section class="card">
-      <h2><span class="num">1</span> Upload &amp; analyze</h2>
-      <p class="hint">Pick a video. We separate speech, transcribe and diarize it into sections.</p>
-      <div class="row">
-        <input type="file" id="videoInput" accept="video/*">
-        <label class="inline">Source language
-          <input id="sourceLang" placeholder="auto" size="6">
+      <div class="card-head"><span class="num">1</span><h2>Upload &amp; chunk</h2></div>
+      <p class="hint">We separate speech from noise, transcribe and diarize into chunks (sections).</p>
+
+      <div class="field-grid">
+        <label class="field">Video file
+          <input type="file" id="videoInput" accept="video/*">
         </label>
-        <button id="analyzeBtn" class="primary">Analyze</button>
+        <label class="field">Source language
+          <input id="sourceLang" placeholder="auto">
+          <small>Leave as “auto” to detect.</small>
+        </label>
       </div>
+
+      <details class="adv">
+        <summary>Chunking settings</summary>
+        <div class="field-grid">
+          <label class="field">Chunk size (sec) <input type="number" id="section_seconds" value="300" min="10" max="600" step="10"><small>Max transcribable section.</small></label>
+          <label class="field">Min VAD pause (sec) <input type="number" id="vad_pause_seconds" value="0.3" min="0.1" max="2" step="0.05"></label>
+          <label class="field">Pause search (sec) <input type="number" id="boundary_search_seconds" value="12" min="0" max="30" step="1"><small>Cut chunks on silences.</small></label>
+          <label class="field">CPU threads <input type="number" id="cpu_threads" value="4" min="1" max="16" step="1"></label>
+          <label class="field switch">Clean speech first
+            <input type="checkbox" id="clean_speech" checked><small>Separate speech from music/noise (best for movies).</small>
+          </label>
+        </div>
+      </details>
+
+      <button id="analyzeBtn" class="primary big">Analyze &amp; chunk</button>
       <div id="analyzeStatus" class="status"></div>
     </section>
 
-    <!-- Analysis result -->
-    <section class="card hidden" id="resultCard">
-      <h2>Sections &amp; transcript</h2>
-      <div id="selInfo" class="meta"></div>
-      <div id="sections"></div>
+    <!-- CHUNKS -->
+    <section class="card hidden" id="chunksCard">
+      <div class="card-head"><h2>Chunks</h2><span id="selInfo" class="meta"></span></div>
+      <p class="hint">Pick a chunk to test. Each chunk is rendered on its own — the whole-video run is your app's job, not this API.</p>
+      <div id="chunks" class="chunk-grid"></div>
     </section>
 
-    <!-- Step 2 -->
+    <!-- STEP 2 — Synthesize a chunk -->
     <section class="card hidden" id="synthCard">
-      <h2><span class="num">2</span> Synthesize a section</h2>
-      <p class="hint">Render one section in a target language. Try several languages — the selection is reused.</p>
-      <div class="grid">
-        <label>Section
+      <div class="card-head"><span class="num">2</span><h2>Test a chunk</h2></div>
+      <p class="hint">Render the selected chunk in a target language. Try several languages &amp; settings — the chunk is reused, so only the render repeats.</p>
+
+      <div class="field-grid">
+        <label class="field">Chunk
           <select id="sectionSel"></select>
         </label>
-        <label>Target language
+        <label class="field">Target language
           <select id="langSel"></select>
         </label>
-        <label>Steps <span id="stepsVal" class="tag">12</span>
+        <label class="field">Steps <b id="stepsVal" class="tag">12</b>
           <input type="range" id="steps" min="8" max="30" value="12">
+          <small>12 = quick test · 20–30 = quality.</small>
         </label>
       </div>
-      <label class="block">Per-speaker voices <span class="muted">(optional — one per line, <code>Speaker 1=voice_id</code>)</span>
+
+      <details class="adv">
+        <summary>Render settings</summary>
+        <div class="field-grid">
+          <label class="field">Frames per batch
+            <select id="frames"><option>4</option><option selected>8</option><option>16</option></select>
+          </label>
+          <label class="field">Audio guidance <input type="number" id="guidance_scale" value="1.5" min="1" max="2.5" step="0.1"></label>
+          <label class="field">Mouth stability <input type="number" id="crop_smoothing" value="0.4" min="0.2" max="0.6" step="0.05"></label>
+          <label class="field">Speaking speed <input type="number" id="speed" value="1.0" min="0.5" max="2" step="0.05"></label>
+          <label class="field">Seed <input type="number" id="seed" value="1247" min="0" step="1"></label>
+          <label class="field">Engine
+            <select id="engine_version"><option selected>1.5</option><option>1.6</option></select>
+          </label>
+          <label class="field">GPU mode
+            <select id="offload"><option selected>auto</option><option>resident</option><option>swap</option></select>
+          </label>
+          <label class="field">Clip target (sec) <input type="number" id="clip_target_seconds" value="17" min="4" max="25" step="1"></label>
+          <label class="field">Clip overlap (sec) <input type="number" id="overlap_seconds" value="0.4" min="0" max="1.5" step="0.1"></label>
+          <label class="field switch">Restore background <input type="checkbox" id="restore_background" checked></label>
+          <label class="field">Background volume <input type="number" id="background_gain" value="1.0" min="0" max="1" step="0.05"></label>
+          <label class="field switch">Face restoration (GFPGAN) <input type="checkbox" id="face_restore"></label>
+          <label class="field">Restoration strength <input type="number" id="restore_strength" value="0.5" min="0" max="1" step="0.05"></label>
+        </div>
+      </details>
+
+      <details class="adv">
+        <summary>Per-speaker voices (optional)</summary>
+        <p class="hint">Pin a 60db voice per speaker; blank = auto-clone. One per line: <code>Speaker 1=voice_id</code></p>
         <textarea id="voices" rows="2" placeholder="Speaker 1=voice_id"></textarea>
         <button id="loadVoices" class="link-btn" type="button">load my 60db voices…</button>
         <div id="voiceList" class="voicelist hidden"></div>
-      </label>
-      <button id="synthBtn" class="primary">Synthesize</button>
+      </details>
+
+      <button id="synthBtn" class="primary big">Synthesize chunk</button>
       <div id="synthStatus" class="status"></div>
     </section>
 
-    <!-- Result -->
+    <!-- RESULT -->
     <section class="card hidden" id="videoCard">
-      <h2>Result</h2>
+      <div class="card-head"><h2>Result</h2></div>
       <video id="player" controls playsinline></video>
       <div class="row">
         <a id="downloadLink" class="button" download>⬇ Download clip</a>
-        <span class="muted">The server deletes the clip after this download — it is played from your browser.</span>
+        <span class="muted">Fetched once — the server deletes it on delivery. Nothing is stored.</span>
       </div>
     </section>
   </main>
 
-  <footer>Lipsync Dubbing Studio · drives the REST API at <code>/v1</code> · outputs are never stored on the server</footer>
+  <footer>
+    Lipsync Dubbing Studio · REST API at <code>/v1</code> ·
+    the API renders <b>one chunk per call</b> (discrete) — batching the whole video is the integrating app's job.
+  </footer>
 
   <script src="/app.js"></script>
 </body>

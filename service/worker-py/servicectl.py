@@ -44,12 +44,19 @@ def _parse_voices(text):
 
 
 def _settings_from_args(args):
+    """Build the settings dict: a full --settings-json object, with individual
+    flags (if given) overriding single keys for CLI convenience."""
     settings = {}
-    for key in ('steps', 'frames', 'seed'):
-        value = getattr(args, key, None)
-        if value is not None:
-            settings[key] = value
-    for key in ('guidance_scale', 'speed'):
+    raw = getattr(args, 'settings_json', None)
+    if raw:
+        try:
+            parsed = json.loads(raw)
+        except ValueError as exc:
+            raise SystemExit(f'--settings-json is not valid JSON: {exc}')
+        if not isinstance(parsed, dict):
+            raise SystemExit('--settings-json must be a JSON object.')
+        settings.update(parsed)
+    for key in ('steps', 'frames', 'seed', 'guidance_scale', 'speed'):
         value = getattr(args, key, None)
         if value is not None:
             settings[key] = value
@@ -116,6 +123,10 @@ def cmd_voices(args):
     _emit({'voices': voices, 'count': len(voices)}, args.json_out)
 
 
+def cmd_defaults(args):
+    _emit(svc.defaults(), args.json_out)
+
+
 def build_parser():
     parser = argparse.ArgumentParser(description='Service pipeline CLI (Phase 0).')
     parser.add_argument('--work-root', type=Path, default=DEFAULT_WORK_ROOT,
@@ -126,6 +137,7 @@ def build_parser():
     a.add_argument('media')
     a.add_argument('--source-language', default=None)
     a.add_argument('--section-seconds', type=float, default=None)
+    a.add_argument('--settings-json', default=None, help='Analyze settings as a JSON object.')
     a.add_argument('--json-out', default=None, help='Write the manifest JSON to this file.')
     a.set_defaults(func=cmd_analyze)
 
@@ -140,6 +152,7 @@ def build_parser():
     s.add_argument('--seed', type=int, default=None)
     s.add_argument('--guidance-scale', dest='guidance_scale', type=float, default=None)
     s.add_argument('--speed', type=float, default=None)
+    s.add_argument('--settings-json', default=None, help='Render settings as a JSON object.')
     s.add_argument('--json-out', default=None, help='Write the result JSON to this file.')
     s.set_defaults(func=cmd_synthesize)
 
@@ -158,6 +171,10 @@ def build_parser():
     vo = sub.add_parser('voices', help='List 60db voices (for per-speaker pinning).')
     vo.add_argument('--json-out', default=None)
     vo.set_defaults(func=cmd_voices)
+
+    df = sub.add_parser('defaults', help='Show default settings and allowed values.')
+    df.add_argument('--json-out', default=None)
+    df.set_defaults(func=cmd_defaults)
     return parser
 
 
