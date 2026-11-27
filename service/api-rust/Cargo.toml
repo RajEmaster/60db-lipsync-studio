@@ -12,7 +12,6 @@ serde_json = "1.0.134"
 tracing = "0.1.41"
 tracing-subscriber = "0.3.19"
 utoipa = { version = "5", features = ["axum_extras"] }
-utoipa-redoc = { version = "5", features = ["axum"] }
 uuid = { version = "1.11.0", features = ["v4"] }
 
 [profile.release]

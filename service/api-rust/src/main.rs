@@ -27,7 +27,7 @@ use std::sync::{Arc, Mutex};
 use axum::{
     extract::{Multipart, Path, State},
     http::{header, StatusCode},
-    response::{IntoResponse, Json, Response},
+    response::{Html, IntoResponse, Json, Response},
     routing::{get, post},
     Router,
 };
@@ -35,7 +35,29 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::Semaphore;
 use utoipa::{OpenApi, ToSchema};
-use utoipa_redoc::{Redoc, Servable};
+
+/// Self-hosted API docs UI (RapiDoc). Bundled into the binary so /docs works with
+/// NO internet / CDN — the earlier ReDoc page was blank when its CDN was unreachable.
+const RAPIDOC_JS: &str = include_str!("../assets/rapidoc-min.js");
+const DOCS_HTML: &str = r#"<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Lipsync Dubbing Service — API</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <script type="module" src="/assets/rapidoc-min.js"></script>
+</head>
+<body>
+  <rapi-doc
+    spec-url="/api-doc/openapi.json"
+    render-style="read"
+    theme="light"
+    show-header="false"
+    allow-try="true"
+    regular-font="-apple-system, BlinkMacSystemFont, Segoe UI, Roboto, sans-serif">
+  </rapi-doc>
+</body>
+</html>"#;
 
 // ============================================================ OpenAPI schemas
 
@@ -149,6 +171,16 @@ impl AppState {
     responses((status = 200, description = "Service is alive")))]
 async fn healthz() -> impl IntoResponse {
     Json(json!({ "status": "ok" }))
+}
+
+/// The self-hosted API docs page (RapiDoc).
+async fn docs_page() -> Html<&'static str> {
+    Html(DOCS_HTML)
+}
+
+/// The bundled RapiDoc script (served locally so /docs needs no internet).
+async fn rapidoc_js() -> impl IntoResponse {
+    ([(header::CONTENT_TYPE, "application/javascript; charset=utf-8")], RAPIDOC_JS)
 }
 
 /// Prepare a selection: separate speech, transcribe, diarize. Upload the video as
@@ -582,7 +614,8 @@ async fn main() {
     });
 
     let app = Router::new()
-        .merge(Redoc::with_url("/docs", ApiDoc::openapi()))
+        .route("/docs", get(docs_page))
+        .route("/assets/rapidoc-min.js", get(rapidoc_js))
         .route("/api-doc/openapi.json", get(|| async { Json(ApiDoc::openapi()) }))
         .route("/healthz", get(healthz))
         .route("/v1/analyze", post(analyze))
