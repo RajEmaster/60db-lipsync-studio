@@ -5,7 +5,7 @@ edition = "2021"
 description = "Thin Rust API gateway for the LatentSync dubbing service (analyze + synthesize)."
 
 [dependencies]
-axum = "0.7.9"
+axum = { version = "0.7.9", features = ["multipart"] }
 tokio = { version = "1.42.0", features = ["full"] }
 serde = { version = "1.0.217", features = ["derive"] }
 serde_json = "1.0.134"
@@ -13,6 +13,7 @@ tracing = "0.1.41"
 tracing-subscriber = "0.3.19"
 utoipa = { version = "5", features = ["axum_extras"] }
 utoipa-redoc = { version = "5", features = ["axum"] }
+uuid = { version = "1.11.0", features = ["v4"] }
 
 [profile.release]
 lto = true

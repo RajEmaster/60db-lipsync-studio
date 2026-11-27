@@ -23,6 +23,8 @@ PIPELINE = ROOT / 'LatentSync-trial'
 sys.path.insert(0, str(PIPELINE))
 
 import service_pipeline as svc   # noqa: E402  (after sys.path setup)
+from translation import LANGUAGES, ORIGINAL_LANGUAGE   # noqa: E402
+from tts_api import list_voices   # noqa: E402
 
 DEFAULT_WORK_ROOT = Path(
     os.environ.get('SERVICE_WORK_ROOT', PIPELINE / 'local_jobs' / 'selections'))
@@ -103,6 +105,17 @@ def cmd_purge(args):
     print(json.dumps({'purged': purged, 'count': len(purged)}))
 
 
+def cmd_languages(args):
+    languages = [name for name in LANGUAGES if name != ORIGINAL_LANGUAGE]
+    _emit({'languages': languages, 'note': 'Names or ISO codes (e.g. "hi") both work.'},
+          args.json_out)
+
+
+def cmd_voices(args):
+    voices = [{'name': name, 'id': voice_id} for name, voice_id in list_voices()]
+    _emit({'voices': voices, 'count': len(voices)}, args.json_out)
+
+
 def build_parser():
     parser = argparse.ArgumentParser(description='Service pipeline CLI (Phase 0).')
     parser.add_argument('--work-root', type=Path, default=DEFAULT_WORK_ROOT,
@@ -137,6 +150,14 @@ def build_parser():
     p = sub.add_parser('purge', help='Remove selections older than the TTL.')
     p.add_argument('--ttl', type=int, default=svc.DEFAULT_TTL_SECONDS)
     p.set_defaults(func=cmd_purge)
+
+    lg = sub.add_parser('languages', help='List supported target languages.')
+    lg.add_argument('--json-out', default=None)
+    lg.set_defaults(func=cmd_languages)
+
+    vo = sub.add_parser('voices', help='List 60db voices (for per-speaker pinning).')
+    vo.add_argument('--json-out', default=None)
+    vo.set_defaults(func=cmd_voices)
     return parser
 
 

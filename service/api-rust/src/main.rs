@@ -1,164 +1,149 @@
-//! Thin Rust API gateway for the LatentSync dubbing service.
+//! Rust API gateway for the LatentSync dubbing service.
 //!
-//! Responsibilities (and ONLY these): HTTP, auth, validation, enqueue jobs to the
-//! queue, report status, stream result files, and delete them on delivery. It never
-//! imports Python, never calls 60db, and never touches the GPU — the Python worker
-//! pool does all compute. The queue is the only contract between them.
+//! Responsibilities (and ONLY these): HTTP, validation, run jobs, report status,
+//! stream result files and delete them on delivery. All ML is done by the Python
+//! worker (`service/worker-py/servicectl.py`), which this server spawns as a
+//! subprocess. The API never imports Python, never calls 60db, never touches the GPU.
 //!
-//! This is the Phase-2 skeleton: routes and request/response schemas are in place and
-//! the server runs with interactive OpenAPI docs; the handlers return 501 until the
-//! Redis queue + worker are wired. The docs let the other team integrate against the
-//! contract now.
+//! Single-box model: an in-memory job registry + a 1-permit GPU semaphore (synthesize
+//! is serialized; analyze runs concurrently). Nothing rendered is retained — the clip
+//! is streamed once from /v1/files/{job_id} and then deleted. To scale out later, swap
+//! the in-memory registry for Redis; the handlers stay the same.
 //!
-//! Interactive docs:  http://127.0.0.1:8080/docs   (Swagger UI)
-//! Raw OpenAPI spec:  http://127.0.0.1:8080/api-doc/openapi.json
+//! Docs:  http://127.0.0.1:8080/docs        (ReDoc)
+//! Spec:  http://127.0.0.1:8080/api-doc/openapi.json
 //!
 //! Endpoints:
-//!   GET  /healthz                     liveness
-//!   POST /v1/analyze                  -> 202 { job_id }     (prepare a selection)
-//!   POST /v1/synthesize               -> 202 { job_id }     (render one section)
-//!   GET  /v1/jobs/{job_id}            -> { status, result } (poll)
-//!   GET  /v1/files/{job_id}           -> streams the clip, then deletes it
+//!   GET  /healthz
+//!   POST /v1/analyze        multipart: file=<video> [, source_language]   -> 202 { job_id }
+//!   POST /v1/synthesize     json: { selection_id, section_id, target_language, ... } -> 202 { job_id }
+//!   GET  /v1/jobs/{job_id}   -> { status, progress, manifest | video_url, error }
+//!   GET  /v1/files/{job_id}  -> streams the clip, then deletes it
 
 use std::collections::HashMap;
+use std::path::{Path as FsPath, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use axum::{
-    extract::Path,
-    http::StatusCode,
-    response::{IntoResponse, Json},
+    extract::{Multipart, Path, State},
+    http::{header, StatusCode},
+    response::{IntoResponse, Json, Response},
     routing::{get, post},
     Router,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use tokio::sync::Semaphore;
 use utoipa::{OpenApi, ToSchema};
 use utoipa_redoc::{Redoc, Servable};
 
-// --------------------------------------------------------------------- schemas
+// ============================================================ OpenAPI schemas
 
-/// One diarized speaker turn with its recovered text (times are global seconds).
 #[derive(Serialize, Deserialize, ToSchema)]
 struct Turn {
-    #[schema(example = 0.57)]
-    start: f64,
-    #[schema(example = 2.44)]
-    end: f64,
-    #[schema(example = "Speaker 1")]
-    speaker: String,
-    #[schema(example = "Are you a broke beauty like me?")]
-    text: String,
+    #[schema(example = 0.57)] start: f64,
+    #[schema(example = 2.44)] end: f64,
+    #[schema(example = "Speaker 1")] speaker: String,
+    #[schema(example = "Are you a broke beauty like me?")] text: String,
 }
 
-/// A chunk of the video the model can transcribe/render as a unit.
 #[derive(Serialize, Deserialize, ToSchema)]
 struct Section {
-    #[schema(example = 1)]
-    id: u32,
-    #[schema(example = 0.0)]
-    start: f64,
-    #[schema(example = 300.0)]
-    end: f64,
-    #[schema(example = 7500)]
-    frames: u32,
-    #[schema(example = json!(["Speaker 1", "Speaker 2"]))]
-    speakers: Vec<String>,
+    #[schema(example = 1)] id: u32,
+    #[schema(example = 0.0)] start: f64,
+    #[schema(example = 300.0)] end: f64,
+    #[schema(example = 7500)] frames: u32,
+    #[schema(example = json!(["Speaker 1", "Speaker 2"]))] speakers: Vec<String>,
     turns: Vec<Turn>,
 }
 
-/// The analyze result: a handle plus the diarized sections. Cached under a TTL so a
-/// user can test many languages on one selection without re-separating.
 #[derive(Serialize, Deserialize, ToSchema)]
 struct Manifest {
-    #[schema(example = "b554135d1ebd4c2c924fa5d32703ea0c")]
-    selection_id: String,
-    #[schema(example = "en")]
-    source_language: Option<String>,
-    #[schema(example = 25)]
-    fps: u32,
-    #[schema(example = 300.0)]
-    max_section_seconds: f64,
+    #[schema(example = "b554135d1ebd4c2c924fa5d32703ea0c")] selection_id: String,
+    #[schema(example = "en")] source_language: Option<String>,
+    #[schema(example = 25)] fps: u32,
+    #[schema(example = 300.0)] max_section_seconds: f64,
     sections: Vec<Section>,
 }
 
-/// Body for POST /v1/analyze. Provide a public `source_url`, or upload the file as
-/// multipart/form-data under the field `file`.
-#[derive(Serialize, Deserialize, ToSchema)]
-struct AnalyzeRequest {
-    #[schema(example = "https://cdn.example.com/clip.mp4")]
-    source_url: Option<String>,
-    /// ISO code or "auto" (default).
-    #[schema(example = "auto")]
-    source_language: Option<String>,
-}
-
-/// Per-call render settings (all optional; vetted defaults are used otherwise).
 #[derive(Serialize, Deserialize, ToSchema)]
 struct Settings {
-    /// Inference steps. 12 = quick preview, 20-30 = quality.
-    #[schema(example = 20)]
-    steps: Option<u32>,
-    /// Frames per batch: 4, 8 or 16 (8 default).
-    #[schema(example = 8)]
-    frames: Option<u32>,
-    #[schema(example = 1.5)]
-    guidance_scale: Option<f64>,
-    #[schema(example = 1247)]
-    seed: Option<u64>,
-    #[schema(example = 1.0)]
-    speed: Option<f64>,
+    #[schema(example = 20)] steps: Option<u32>,
+    #[schema(example = 8)] frames: Option<u32>,
+    #[schema(example = 1.5)] guidance_scale: Option<f64>,
+    #[schema(example = 1247)] seed: Option<u64>,
+    #[schema(example = 1.0)] speed: Option<f64>,
 }
 
-/// Body for POST /v1/synthesize. `speaker_voices` pins a 60db voice per speaker
-/// (omit to auto-clone from the original).
 #[derive(Serialize, Deserialize, ToSchema)]
 struct SynthesizeRequest {
-    #[schema(example = "b554135d1ebd4c2c924fa5d32703ea0c")]
-    selection_id: String,
-    #[schema(example = 1)]
-    section_id: u32,
-    #[schema(example = "hi")]
-    target_language: String,
+    #[schema(example = "b554135d1ebd4c2c924fa5d32703ea0c")] selection_id: String,
+    #[schema(example = 1)] section_id: u32,
+    #[schema(example = "hi")] target_language: String,
     #[schema(example = json!({"Speaker 1": "f05d13fe-d3b0-400d-91a8-5422c7dda0e5"}))]
     speaker_voices: Option<HashMap<String, String>>,
     settings: Option<Settings>,
 }
 
-/// 202 Accepted body: a job was enqueued; poll it at GET /v1/jobs/{job_id}.
 #[derive(Serialize, Deserialize, ToSchema)]
 struct JobAccepted {
-    #[schema(example = "s_9c2a1f...")]
-    job_id: String,
-    #[schema(example = "queued")]
-    status: String,
+    #[schema(example = "7f3c1a9b2d4e4f6a8b0c1d2e3f405162")] job_id: String,
+    #[schema(example = "queued")] status: String,
 }
 
-/// Job poll result. `manifest` is set when a done job was an analyze; `video_url`
-/// when it was a synthesize. `error` is set on failure.
 #[derive(Serialize, Deserialize, ToSchema)]
 struct JobStatus {
     /// queued | running | done | failed
-    #[schema(example = "running")]
-    status: String,
-    #[schema(example = 0.6)]
-    progress: Option<f64>,
+    #[schema(example = "running")] status: String,
+    #[schema(example = 0.5)] progress: f64,
     manifest: Option<Manifest>,
-    #[schema(example = "/v1/files/s_9c2a1f")]
-    video_url: Option<String>,
+    #[schema(example = "/v1/files/7f3c1a9b")] video_url: Option<String>,
     error: Option<String>,
 }
 
-/// Standard error body.
 #[derive(Serialize, Deserialize, ToSchema)]
 struct ErrorResponse {
-    #[schema(example = "InvalidInput")]
-    error: String,
-    #[schema(example = 400)]
-    status: u16,
-    #[schema(example = "target_language is required.")]
-    message: String,
+    #[schema(example = "InvalidInput")] error: String,
+    #[schema(example = 400)] status: u16,
+    #[schema(example = "target_language is required.")] message: String,
 }
 
-// --------------------------------------------------------------------- handlers
+// ============================================================ app state
+
+#[derive(Clone)]
+struct AppConfig {
+    python: PathBuf,
+    servicectl: PathBuf,
+    work_root: PathBuf,
+    tmp_dir: PathBuf,
+}
+
+struct JobRec {
+    kind: &'static str, // "analyze" | "synthesize"
+    status: String,     // queued | running | done | failed
+    progress: f64,
+    manifest: Option<Value>,
+    video_path: Option<PathBuf>,
+    error: Option<String>,
+}
+
+struct AppState {
+    cfg: AppConfig,
+    jobs: Mutex<HashMap<String, JobRec>>,
+    gpu: Semaphore, // serialize synthesize (GPU) jobs
+}
+
+type Shared = Arc<AppState>;
+
+impl AppState {
+    fn set<F: FnOnce(&mut JobRec)>(&self, id: &str, f: F) {
+        if let Some(j) = self.jobs.lock().unwrap().get_mut(id) {
+            f(j);
+        }
+    }
+}
+
+// ============================================================ handlers
 
 #[utoipa::path(get, path = "/healthz", tag = "service",
     responses((status = 200, description = "Service is alive")))]
@@ -166,16 +151,61 @@ async fn healthz() -> impl IntoResponse {
     Json(json!({ "status": "ok" }))
 }
 
-/// Prepare a selection: separate speech, transcribe, diarize. Returns a job id;
+/// Prepare a selection: separate speech, transcribe, diarize. Upload the video as
+/// multipart/form-data under `file` (optional `source_language`). Returns a job id;
 /// poll it, and the done job's `manifest` holds the sections + turns.
 #[utoipa::path(post, path = "/v1/analyze", tag = "service",
-    request_body = AnalyzeRequest,
+    request_body(content_type = "multipart/form-data", description = "file=<video>, source_language=<optional>"),
     responses(
         (status = 202, description = "Job enqueued", body = JobAccepted),
         (status = 400, description = "Invalid input", body = ErrorResponse),
     ))]
-async fn analyze() -> impl IntoResponse {
-    not_implemented("POST /v1/analyze")
+async fn analyze(State(st): State<Shared>, mut form: Multipart) -> Response {
+    let mut upload: Option<PathBuf> = None;
+    let mut source_language: Option<String> = None;
+
+    loop {
+        let field = match form.next_field().await {
+            Ok(Some(f)) => f,
+            Ok(None) => break,
+            Err(e) => return bad_request(&format!("malformed multipart: {e}")),
+        };
+        match field.name().unwrap_or("") {
+            "file" => {
+                let ext = field
+                    .file_name()
+                    .and_then(|n| FsPath::new(n).extension().and_then(|e| e.to_str()))
+                    .unwrap_or("mp4")
+                    .to_string();
+                let bytes = match field.bytes().await {
+                    Ok(b) => b,
+                    Err(e) => return bad_request(&format!("could not read upload: {e}")),
+                };
+                let path = st.cfg.tmp_dir.join(format!("up_{}.{}", uuid::Uuid::new_v4().simple(), ext));
+                if let Err(e) = tokio::fs::write(&path, &bytes).await {
+                    return server_error(&format!("could not save upload: {e}"));
+                }
+                upload = Some(path);
+            }
+            "source_language" => {
+                source_language = field.text().await.ok().filter(|s| !s.trim().is_empty());
+            }
+            _ => {}
+        }
+    }
+
+    let upload = match upload {
+        Some(p) => p,
+        None => return bad_request("multipart field 'file' (the video) is required."),
+    };
+
+    let job_id = new_id();
+    insert_job(&st, &job_id, "analyze");
+    let st2 = st.clone();
+    let id2 = job_id.clone();
+    tokio::spawn(async move { run_analyze(st2, id2, upload, source_language).await });
+
+    accepted(&job_id)
 }
 
 /// Render ONE section of a prepared selection in a target language. Returns a job id;
@@ -185,11 +215,17 @@ async fn analyze() -> impl IntoResponse {
     responses(
         (status = 202, description = "Job enqueued", body = JobAccepted),
         (status = 400, description = "Invalid input", body = ErrorResponse),
-        (status = 404, description = "Unknown or expired selection", body = ErrorResponse),
-        (status = 409, description = "Selection already rendering", body = ErrorResponse),
     ))]
-async fn synthesize() -> impl IntoResponse {
-    not_implemented("POST /v1/synthesize")
+async fn synthesize(State(st): State<Shared>, Json(req): Json<SynthesizeRequest>) -> Response {
+    if req.selection_id.trim().is_empty() || req.target_language.trim().is_empty() {
+        return bad_request("selection_id and target_language are required.");
+    }
+    let job_id = new_id();
+    insert_job(&st, &job_id, "synthesize");
+    let st2 = st.clone();
+    let id2 = job_id.clone();
+    tokio::spawn(async move { run_synthesize(st2, id2, req).await });
+    accepted(&job_id)
 }
 
 /// Poll a job's status/result.
@@ -199,8 +235,24 @@ async fn synthesize() -> impl IntoResponse {
         (status = 200, description = "Job status", body = JobStatus),
         (status = 404, description = "Unknown job", body = ErrorResponse),
     ))]
-async fn job_status(Path(job_id): Path<String>) -> impl IntoResponse {
-    not_implemented(&format!("GET /v1/jobs/{job_id}"))
+async fn job_status(State(st): State<Shared>, Path(job_id): Path<String>) -> Response {
+    let jobs = st.jobs.lock().unwrap();
+    let Some(j) = jobs.get(&job_id) else {
+        return error_json(StatusCode::NOT_FOUND, "NotFound", "Unknown job.");
+    };
+    let video_url = if j.kind == "synthesize" && j.status == "done" {
+        Some(format!("/v1/files/{job_id}"))
+    } else {
+        None
+    };
+    Json(json!({
+        "status": j.status,
+        "progress": j.progress,
+        "manifest": j.manifest,
+        "video_url": video_url,
+        "error": j.error,
+    }))
+    .into_response()
 }
 
 /// Stream the rendered clip for a done synthesize job, then delete it (never retained).
@@ -208,24 +260,248 @@ async fn job_status(Path(job_id): Path<String>) -> impl IntoResponse {
     params(("job_id" = String, Path, description = "Synthesize job id")),
     responses(
         (status = 200, description = "The MP4 clip", content_type = "video/mp4"),
-        (status = 404, description = "No such clip (not ready or already delivered)", body = ErrorResponse),
+        (status = 404, description = "No clip (not ready or already delivered)", body = ErrorResponse),
     ))]
-async fn file_download(Path(job_id): Path<String>) -> impl IntoResponse {
-    not_implemented(&format!("GET /v1/files/{job_id}"))
+async fn file_download(State(st): State<Shared>, Path(job_id): Path<String>) -> Response {
+    let path = {
+        let jobs = st.jobs.lock().unwrap();
+        match jobs.get(&job_id).and_then(|j| j.video_path.clone()) {
+            Some(p) => p,
+            None => return error_json(StatusCode::NOT_FOUND, "NotFound", "No clip for this job."),
+        }
+    };
+    match tokio::fs::read(&path).await {
+        Ok(bytes) => {
+            let _ = tokio::fs::remove_file(&path).await; // delete on delivery
+            st.set(&job_id, |j| j.video_path = None);
+            (
+                [(header::CONTENT_TYPE, "video/mp4")],
+                bytes,
+            )
+                .into_response()
+        }
+        Err(_) => error_json(StatusCode::NOT_FOUND, "NotFound", "Clip already delivered or missing."),
+    }
 }
 
-fn not_implemented(endpoint: &str) -> (StatusCode, Json<Value>) {
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(json!({
-            "error": "not_implemented",
-            "endpoint": endpoint,
-            "message": "Phase 2: this route is wired to the Python worker queue next."
-        })),
-    )
+/// List the supported target languages (names; ISO codes like "hi" also work).
+#[utoipa::path(get, path = "/v1/languages", tag = "service",
+    responses((status = 200, description = "Supported languages")))]
+async fn languages(State(st): State<Shared>) -> Response {
+    match worker_json(&st.cfg, &["languages"]).await {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => server_error(&e),
+    }
 }
 
-// --------------------------------------------------------------------- openapi
+/// List the account's 60db voices (use an `id` to pin a voice per speaker).
+#[utoipa::path(get, path = "/v1/voices", tag = "service",
+    responses((status = 200, description = "60db voices")))]
+async fn voices(State(st): State<Shared>) -> Response {
+    match worker_json(&st.cfg, &["voices"]).await {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => server_error(&e),
+    }
+}
+
+/// Release a prepared selection and everything cached for it.
+#[utoipa::path(delete, path = "/v1/selections/{selection_id}", tag = "service",
+    params(("selection_id" = String, Path, description = "Selection handle from analyze")),
+    responses((status = 200, description = "Released")))]
+async fn release_selection(State(st): State<Shared>, Path(sel): Path<String>) -> Response {
+    let mut cmd = tokio::process::Command::new(&st.cfg.python);
+    cmd.arg(&st.cfg.servicectl)
+        .arg("--work-root").arg(&st.cfg.work_root)
+        .arg("release").arg(&sel);
+    match cmd.output().await {
+        Ok(o) if o.status.success() => {
+            Json(json!({ "selection_id": sel, "released": true })).into_response()
+        }
+        Ok(o) => server_error(&worker_error(&o.stderr)),
+        Err(e) => server_error(&e.to_string()),
+    }
+}
+
+/// Forget a job and delete its pending clip, if any. A running render is not killed;
+/// its result is simply discarded.
+#[utoipa::path(delete, path = "/v1/jobs/{job_id}", tag = "service",
+    params(("job_id" = String, Path, description = "Job id")),
+    responses(
+        (status = 200, description = "Job forgotten"),
+        (status = 404, description = "Unknown job", body = ErrorResponse),
+    ))]
+async fn cancel_job(State(st): State<Shared>, Path(job_id): Path<String>) -> Response {
+    let removed = { st.jobs.lock().unwrap().remove(&job_id) };
+    match removed {
+        Some(j) => {
+            if let Some(p) = j.video_path {
+                let _ = tokio::fs::remove_file(p).await;
+            }
+            Json(json!({ "job_id": job_id, "removed": true })).into_response()
+        }
+        None => error_json(StatusCode::NOT_FOUND, "NotFound", "Unknown job."),
+    }
+}
+
+// ============================================================ workers
+
+async fn run_analyze(st: Shared, job_id: String, upload: PathBuf, lang: Option<String>) {
+    st.set(&job_id, |j| { j.status = "running".into(); j.progress = 0.1; });
+    let result = st.cfg.tmp_dir.join(format!("{job_id}.manifest.json"));
+
+    let mut cmd = tokio::process::Command::new(&st.cfg.python);
+    cmd.arg(&st.cfg.servicectl)
+        .arg("--work-root").arg(&st.cfg.work_root)
+        .arg("analyze").arg(&upload)
+        .arg("--json-out").arg(&result);
+    if let Some(l) = lang {
+        cmd.arg("--source-language").arg(l);
+    }
+
+    let out = cmd.output().await;
+    let _ = tokio::fs::remove_file(&upload).await;
+
+    match out {
+        Ok(o) if o.status.success() => match tokio::fs::read(&result).await {
+            Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
+                Ok(manifest) => st.set(&job_id, |j| {
+                    j.status = "done".into();
+                    j.progress = 1.0;
+                    j.manifest = Some(manifest);
+                }),
+                Err(e) => fail(&st, &job_id, &format!("bad manifest json: {e}")),
+            },
+            Err(e) => fail(&st, &job_id, &format!("manifest not written: {e}")),
+        },
+        Ok(o) => fail(&st, &job_id, &worker_error(&o.stderr)),
+        Err(e) => fail(&st, &job_id, &format!("failed to run worker: {e}")),
+    }
+    let _ = tokio::fs::remove_file(&result).await;
+}
+
+async fn run_synthesize(st: Shared, job_id: String, req: SynthesizeRequest) {
+    st.set(&job_id, |j| { j.status = "queued".into(); j.progress = 0.05; });
+    let _permit = st.gpu.acquire().await.expect("semaphore closed"); // serialize GPU work
+    st.set(&job_id, |j| { j.status = "running".into(); j.progress = 0.2; });
+
+    let video = st.cfg.tmp_dir.join(format!("{job_id}.mp4"));
+    let result = st.cfg.tmp_dir.join(format!("{job_id}.result.json"));
+
+    let mut cmd = tokio::process::Command::new(&st.cfg.python);
+    cmd.arg(&st.cfg.servicectl)
+        .arg("--work-root").arg(&st.cfg.work_root)
+        .arg("synthesize")
+        .arg(&req.selection_id)
+        .arg(req.section_id.to_string())
+        .arg(&req.target_language)
+        .arg("--out").arg(&video)
+        .arg("--json-out").arg(&result);
+
+    if let Some(voices) = &req.speaker_voices {
+        if !voices.is_empty() {
+            let spec = voices.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(",");
+            cmd.arg("--voices").arg(spec);
+        }
+    }
+    if let Some(s) = &req.settings {
+        if let Some(v) = s.steps { cmd.arg("--steps").arg(v.to_string()); }
+        if let Some(v) = s.frames { cmd.arg("--frames").arg(v.to_string()); }
+        if let Some(v) = s.seed { cmd.arg("--seed").arg(v.to_string()); }
+        if let Some(v) = s.guidance_scale { cmd.arg("--guidance-scale").arg(v.to_string()); }
+        if let Some(v) = s.speed { cmd.arg("--speed").arg(v.to_string()); }
+    }
+
+    let out = cmd.output().await;
+    let _ = tokio::fs::remove_file(&result).await;
+
+    match out {
+        Ok(o) if o.status.success() && video.is_file() => st.set(&job_id, |j| {
+            j.status = "done".into();
+            j.progress = 1.0;
+            j.video_path = Some(video.clone());
+        }),
+        Ok(o) if o.status.success() => fail(&st, &job_id, "worker produced no video."),
+        Ok(o) => fail(&st, &job_id, &worker_error(&o.stderr)),
+        Err(e) => fail(&st, &job_id, &format!("failed to run worker: {e}")),
+    }
+}
+
+/// servicectl prints a JSON error ({error,status,message}) to stderr on failure.
+/// Return its message if parseable, else the last non-empty stderr line.
+fn worker_error(stderr: &[u8]) -> String {
+    let text = String::from_utf8_lossy(stderr);
+    for line in text.lines().rev() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_str::<Value>(line) {
+            if let Some(msg) = v.get("message").and_then(|m| m.as_str()) {
+                return msg.to_string();
+            }
+        }
+        return line.to_string();
+    }
+    "worker failed with no output".into()
+}
+
+/// Run a read-only worker subcommand (languages/voices) and return its JSON.
+async fn worker_json(cfg: &AppConfig, subcmd: &[&str]) -> Result<Value, String> {
+    let tmp = cfg.tmp_dir.join(format!("q_{}.json", uuid::Uuid::new_v4().simple()));
+    let mut cmd = tokio::process::Command::new(&cfg.python);
+    cmd.arg(&cfg.servicectl).arg("--work-root").arg(&cfg.work_root);
+    for a in subcmd {
+        cmd.arg(a);
+    }
+    cmd.arg("--json-out").arg(&tmp);
+    let out = cmd.output().await.map_err(|e| e.to_string())?;
+    let result = if out.status.success() {
+        match tokio::fs::read(&tmp).await {
+            Ok(b) => serde_json::from_slice::<Value>(&b).map_err(|e| e.to_string()),
+            Err(e) => Err(e.to_string()),
+        }
+    } else {
+        Err(worker_error(&out.stderr))
+    };
+    let _ = tokio::fs::remove_file(&tmp).await;
+    result
+}
+
+// ============================================================ small helpers
+
+fn new_id() -> String {
+    uuid::Uuid::new_v4().simple().to_string()
+}
+
+fn insert_job(st: &AppState, id: &str, kind: &'static str) {
+    st.jobs.lock().unwrap().insert(
+        id.to_string(),
+        JobRec { kind, status: "queued".into(), progress: 0.0, manifest: None, video_path: None, error: None },
+    );
+}
+
+fn fail(st: &AppState, id: &str, msg: &str) {
+    tracing::warn!("job {id} failed: {msg}");
+    st.set(id, |j| { j.status = "failed".into(); j.error = Some(msg.to_string()); });
+}
+
+fn accepted(job_id: &str) -> Response {
+    (StatusCode::ACCEPTED, Json(json!({ "job_id": job_id, "status": "queued" }))).into_response()
+}
+
+fn error_json(code: StatusCode, error: &str, message: &str) -> Response {
+    (code, Json(json!({ "error": error, "status": code.as_u16(), "message": message }))).into_response()
+}
+
+fn bad_request(message: &str) -> Response {
+    error_json(StatusCode::BAD_REQUEST, "InvalidInput", message)
+}
+
+fn server_error(message: &str) -> Response {
+    error_json(StatusCode::INTERNAL_SERVER_ERROR, "ServerError", message)
+}
+
+// ============================================================ openapi + main
 
 #[derive(OpenApi)]
 #[openapi(
@@ -235,35 +511,91 @@ fn not_implemented(endpoint: &str) -> (StatusCode, Json<Value>) {
         description = "Analyze a video into diarized sections, then synthesize one \
                        section in a target language. Outputs are never stored."
     ),
-    paths(healthz, analyze, synthesize, job_status, file_download),
+    paths(healthz, analyze, synthesize, job_status, file_download,
+          languages, voices, release_selection, cancel_job),
     components(schemas(
-        Turn, Section, Manifest, AnalyzeRequest, Settings, SynthesizeRequest,
+        Turn, Section, Manifest, Settings, SynthesizeRequest,
         JobAccepted, JobStatus, ErrorResponse
     )),
     tags((name = "service", description = "Analyze & synthesize operations"))
 )]
 struct ApiDoc;
 
-// --------------------------------------------------------------------- main
+fn resolve_config() -> AppConfig {
+    // Defaults assume the server runs from service/api-rust (cargo run) and the repo
+    // layout is intact. Override any of these with env vars.
+    let here = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let pipeline = env_path("PIPELINE_DIR", here.join("../../LatentSync-trial"));
+    let python = env_path("PYTHON", pipeline.join(".venv/Scripts/python.exe"));
+    let servicectl = env_path("SERVICECTL", here.join("../worker-py/servicectl.py"));
+    let work_root = env_path("WORK_ROOT", pipeline.join("local_jobs/selections"));
+    let tmp_dir = env_path("SERVICE_TMP", pipeline.join("local_jobs/service_tmp"));
+
+    for (label, path, must_exist) in [
+        ("PYTHON", &python, true),
+        ("SERVICECTL", &servicectl, true),
+    ] {
+        if must_exist && !path.exists() {
+            panic!("{label} not found at {} — set the {label} env var.", path.display());
+        }
+    }
+    std::fs::create_dir_all(&work_root).ok();
+    std::fs::create_dir_all(&tmp_dir).ok();
+
+    AppConfig {
+        python: clean_path(python),
+        servicectl: clean_path(servicectl),
+        work_root: clean_path(work_root),
+        tmp_dir: clean_path(tmp_dir),
+    }
+}
+
+/// Absolute, `..`-resolved path WITHOUT the Windows `\\?\` extended-length prefix.
+/// That prefix (added by `canonicalize`) propagates through the Python subprocess and
+/// breaks ffmpeg / the render engine, so we strip it.
+fn clean_path(path: PathBuf) -> PathBuf {
+    let resolved = path.canonicalize().unwrap_or(path);
+    let s = resolved.to_string_lossy();
+    match s.strip_prefix(r"\\?\") {
+        Some(rest) if !rest.starts_with("UNC\\") => PathBuf::from(rest),
+        _ => resolved,
+    }
+}
+
+fn env_path(key: &str, default: PathBuf) -> PathBuf {
+    std::env::var(key).map(PathBuf::from).unwrap_or(default)
+}
 
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
 
+    let cfg = resolve_config();
+    tracing::info!("python     = {}", cfg.python.display());
+    tracing::info!("servicectl = {}", cfg.servicectl.display());
+    tracing::info!("work_root  = {}", cfg.work_root.display());
+
+    let state: Shared = Arc::new(AppState {
+        cfg,
+        jobs: Mutex::new(HashMap::new()),
+        gpu: Semaphore::new(1), // one synthesize (GPU) job at a time
+    });
+
     let app = Router::new()
-        // Interactive docs at /docs, and the raw OpenAPI spec for Postman/clients.
         .merge(Redoc::with_url("/docs", ApiDoc::openapi()))
         .route("/api-doc/openapi.json", get(|| async { Json(ApiDoc::openapi()) }))
         .route("/healthz", get(healthz))
         .route("/v1/analyze", post(analyze))
         .route("/v1/synthesize", post(synthesize))
-        .route("/v1/jobs/:job_id", get(job_status))
-        .route("/v1/files/:job_id", get(file_download));
+        .route("/v1/jobs/:job_id", get(job_status).delete(cancel_job))
+        .route("/v1/files/:job_id", get(file_download))
+        .route("/v1/languages", get(languages))
+        .route("/v1/voices", get(voices))
+        .route("/v1/selections/:selection_id", axum::routing::delete(release_selection))
+        .with_state(state);
 
     let addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".to_string());
-    let listener = tokio::net::TcpListener::bind(&addr)
-        .await
-        .expect("failed to bind address");
+    let listener = tokio::net::TcpListener::bind(&addr).await.expect("failed to bind address");
     tracing::info!("lipsync-service-api on http://{addr}  (docs at /docs)");
     axum::serve(listener, app).await.expect("server error");
 }
