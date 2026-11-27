@@ -59,6 +59,32 @@ const DOCS_HTML: &str = r#"<!doctype html>
 </body>
 </html>"#;
 
+/// Self-hosted Swagger UI (the familiar one, with Try-it-out). Also bundled so it
+/// needs no internet.
+const SWAGGER_JS: &str = include_str!("../assets/swagger-ui-bundle.js");
+const SWAGGER_CSS: &str = include_str!("../assets/swagger-ui.css");
+const SWAGGER_HTML: &str = r##"<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Lipsync Dubbing Service — API</title>
+  <link rel="stylesheet" href="/assets/swagger-ui.css"/>
+</head>
+<body>
+  <div id="swagger-ui"></div>
+  <script src="/assets/swagger-ui-bundle.js"></script>
+  <script>
+    window.ui = SwaggerUIBundle({
+      url: "/api-doc/openapi.json",
+      dom_id: "#swagger-ui",
+      deepLinking: true,
+      presets: [SwaggerUIBundle.presets.apis]
+    });
+  </script>
+</body>
+</html>"##;
+
 // ============================================================ OpenAPI schemas
 
 #[derive(Serialize, Deserialize, ToSchema)]
@@ -178,9 +204,22 @@ async fn docs_page() -> Html<&'static str> {
     Html(DOCS_HTML)
 }
 
-/// The bundled RapiDoc script (served locally so /docs needs no internet).
+/// The bundled RapiDoc script (served locally so the docs need no internet).
 async fn rapidoc_js() -> impl IntoResponse {
     ([(header::CONTENT_TYPE, "application/javascript; charset=utf-8")], RAPIDOC_JS)
+}
+
+/// Swagger UI page (default at /docs).
+async fn swagger_page() -> Html<&'static str> {
+    Html(SWAGGER_HTML)
+}
+
+async fn swagger_js() -> impl IntoResponse {
+    ([(header::CONTENT_TYPE, "application/javascript; charset=utf-8")], SWAGGER_JS)
+}
+
+async fn swagger_css() -> impl IntoResponse {
+    ([(header::CONTENT_TYPE, "text/css; charset=utf-8")], SWAGGER_CSS)
 }
 
 /// Prepare a selection: separate speech, transcribe, diarize. Upload the video as
@@ -614,7 +653,10 @@ async fn main() {
     });
 
     let app = Router::new()
-        .route("/docs", get(docs_page))
+        .route("/docs", get(swagger_page))            // Swagger UI (default)
+        .route("/rapidoc", get(docs_page))            // RapiDoc alternative
+        .route("/assets/swagger-ui-bundle.js", get(swagger_js))
+        .route("/assets/swagger-ui.css", get(swagger_css))
         .route("/assets/rapidoc-min.js", get(rapidoc_js))
         .route("/api-doc/openapi.json", get(|| async { Json(ApiDoc::openapi()) }))
         .route("/healthz", get(healthz))
