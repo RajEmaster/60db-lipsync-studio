@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Lipsync Dubbing Studio</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">🎬 Lipsync Dubbing Studio</div>
+    <div class="links">
+      <span id="health" class="pill">checking…</span>
+      <a href="/docs" target="_blank">API docs</a>
+    </div>
+  </header>
+
+  <main>
+    <!-- Step 1 -->
+    <section class="card">
+      <h2><span class="num">1</span> Upload &amp; analyze</h2>
+      <p class="hint">Pick a video. We separate speech, transcribe and diarize it into sections.</p>
+      <div class="row">
+        <input type="file" id="videoInput" accept="video/*">
+        <label class="inline">Source language
+          <input id="sourceLang" placeholder="auto" size="6">
+        </label>
+        <button id="analyzeBtn" class="primary">Analyze</button>
+      </div>
+      <div id="analyzeStatus" class="status"></div>
+    </section>
+
+    <!-- Analysis result -->
+    <section class="card hidden" id="resultCard">
+      <h2>Sections &amp; transcript</h2>
+      <div id="selInfo" class="meta"></div>
+      <div id="sections"></div>
+    </section>
+
+    <!-- Step 2 -->
+    <section class="card hidden" id="synthCard">
+      <h2><span class="num">2</span> Synthesize a section</h2>
+      <p class="hint">Render one section in a target language. Try several languages — the selection is reused.</p>
+      <div class="grid">
+        <label>Section
+          <select id="sectionSel"></select>
+        </label>
+        <label>Target language
+          <select id="langSel"></select>
+        </label>
+        <label>Steps <span id="stepsVal" class="tag">12</span>
+          <input type="range" id="steps" min="8" max="30" value="12">
+        </label>
+      </div>
+      <label class="block">Per-speaker voices <span class="muted">(optional — one per line, <code>Speaker 1=voice_id</code>)</span>
+        <textarea id="voices" rows="2" placeholder="Speaker 1=voice_id"></textarea>
+        <button id="loadVoices" class="link-btn" type="button">load my 60db voices…</button>
+        <div id="voiceList" class="voicelist hidden"></div>
+      </label>
+      <button id="synthBtn" class="primary">Synthesize</button>
+      <div id="synthStatus" class="status"></div>
+    </section>
+
+    <!-- Result -->
+    <section class="card hidden" id="videoCard">
+      <h2>Result</h2>
+      <video id="player" controls playsinline></video>
+      <div class="row">
+        <a id="downloadLink" class="button" download>⬇ Download clip</a>
+        <span class="muted">The server deletes the clip after this download — it is played from your browser.</span>
+      </div>
+    </section>
+  </main>
+
+  <footer>Lipsync Dubbing Studio · drives the REST API at <code>/v1</code> · outputs are never stored on the server</footer>
+
+  <script src="/app.js"></script>
+</body>
+</html>

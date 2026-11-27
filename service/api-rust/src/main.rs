@@ -34,6 +34,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::Semaphore;
+use tower_http::services::ServeDir;
 use utoipa::{OpenApi, ToSchema};
 
 /// Self-hosted API docs UI (RapiDoc). Bundled into the binary so /docs works with
@@ -164,6 +165,7 @@ struct AppConfig {
     servicectl: PathBuf,
     work_root: PathBuf,
     tmp_dir: PathBuf,
+    web_dir: PathBuf,
 }
 
 struct JobRec {
@@ -601,6 +603,7 @@ fn resolve_config() -> AppConfig {
     let servicectl = env_path("SERVICECTL", here.join("../worker-py/servicectl.py"));
     let work_root = env_path("WORK_ROOT", pipeline.join("local_jobs/selections"));
     let tmp_dir = env_path("SERVICE_TMP", pipeline.join("local_jobs/service_tmp"));
+    let web_dir = env_path("WEB_DIR", here.join("../web"));
 
     for (label, path, must_exist) in [
         ("PYTHON", &python, true),
@@ -618,6 +621,7 @@ fn resolve_config() -> AppConfig {
         servicectl: clean_path(servicectl),
         work_root: clean_path(work_root),
         tmp_dir: clean_path(tmp_dir),
+        web_dir: clean_path(web_dir),
     }
 }
 
@@ -645,6 +649,8 @@ async fn main() {
     tracing::info!("python     = {}", cfg.python.display());
     tracing::info!("servicectl = {}", cfg.servicectl.display());
     tracing::info!("work_root  = {}", cfg.work_root.display());
+    tracing::info!("web_dir    = {}", cfg.web_dir.display());
+    let web_dir = cfg.web_dir.clone();
 
     let state: Shared = Arc::new(AppState {
         cfg,
@@ -667,7 +673,10 @@ async fn main() {
         .route("/v1/languages", get(languages))
         .route("/v1/voices", get(voices))
         .route("/v1/selections/:selection_id", axum::routing::delete(release_selection))
-        .with_state(state);
+        .with_state(state)
+        // The web UI (served from disk so it can be tuned without a rebuild). Any path
+        // not matched above falls through to the static files, so "/" serves index.html.
+        .fallback_service(ServeDir::new(&web_dir));
 
     let addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".to_string());
     let listener = tokio::net::TcpListener::bind(&addr).await.expect("failed to bind address");
